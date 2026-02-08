@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        emacs_version: ["29.1"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Emacs
+        uses: purcell/setup-emacs@v6.0
+        with:
+          version: ${{ matrix.emacs_version }}
+
+      - name: Test
+        shell: bash
+        run: ./scripts/test.sh
+
+      - name: Byte Compile
+        shell: bash
+        run: ./scripts/byte-compile.sh
+
+      - name: Checkdoc
+        shell: bash
+        run: ./scripts/checkdoc.sh
+

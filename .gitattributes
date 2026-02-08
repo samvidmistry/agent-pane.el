@@ -1,0 +1,29 @@
+# Enforce LF line endings in the repository.
+#
+# We develop on Windows (Git Bash/PowerShell), but the project prefers LF for
+# consistency and to avoid subtle test failures.
+
+# Default: treat as text and normalize to LF.
+* text=auto eol=lf
+
+# Explicit common types.
+*.el      text eol=lf
+*.md      text eol=lf
+*.org     text eol=lf
+*.sh      text eol=lf
+*.ps1     text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.json    text eol=lf
+*.toml    text eol=lf
+*.txt     text eol=lf
+*.traffic text eol=lf
+
+# Binary artifacts.
+*.elc binary
+*.eln binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary

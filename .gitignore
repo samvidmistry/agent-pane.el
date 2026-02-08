@@ -1,0 +1,10 @@
+*.elc
+*.eln
+*~
+\#*\#
+/.cache/
+/.local/
+/dist/
+/build/
+/transcripts/
+
