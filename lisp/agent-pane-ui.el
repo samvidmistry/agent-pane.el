@@ -279,9 +279,11 @@ END is the message end (after trailing blank line)."
              'agent-pane-message msg
              'agent-pane-raw (map-elt msg :raw))
             (set-marker text-end (point))
-            ;; Refontify a small window so delimiters spanning chunks are handled.
-            (let ((beg (max (or (plist-get loc :text-beg) old-end)
-                            (- old-end agent-pane-markdown-fontify-backtrack))))
+            ;; Refontify the full message body so markdown delimiters that open
+            ;; in older chunks and close in newer chunks are handled reliably.
+            (let ((beg (or (and (markerp (plist-get loc :text-beg))
+                                (marker-position (plist-get loc :text-beg)))
+                           old-end)))
               (agent-pane--md-fontify-range (map-elt msg :role) beg (point)))
             (when (eq (map-elt msg :role) 'tool)
               (when-let ((tool-beg (plist-get loc :text-beg)))
@@ -571,7 +573,7 @@ Verbose connection/session/debug fields are shown only when expanded."
                                    :stderr stderr-name)
              'face 'agent-pane-header-info))
           (agent-pane--insert-read-only
-           "Keys: C-c C-c send | C-c C-k cancel | C-c C-q exit | C-c v details | C-c C-m model | C-c C-d diff | C-c C-o output-mode | C-c C-i edit-input | C-c C-y last-user | C-c C-w last-tool | C-c C-b code-block | M-p/M-n history | C-c C-p/C-c C-n jump-msg | C-c C-f fold | C-c C-t traffic | C-c C-l logs | C-c C-e stderr | C-c C-s state | C-c C-r raw\n"
+           "Keys: C-c . menu | C-c C-c send | C-c C-k cancel | C-c C-q exit | C-c v details | C-c m model | C-c d diff | C-c o output-mode | C-c i edit-input | C-c C-y last-user | C-c C-w last-tool | C-c C-b code-block | M-p/M-n history | C-c C-p/C-c C-n jump-msg | C-c C-f fold | C-c C-t traffic | C-c C-l logs | C-c C-e stderr | C-c C-s state | C-c C-r raw\n"
            'agent-pane-header t
            'face 'agent-pane-header-keys)
           (agent-pane--insert-read-only "\n" 'agent-pane-header t 'face 'agent-pane-separator))))))

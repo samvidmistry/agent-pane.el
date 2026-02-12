@@ -323,19 +323,46 @@ Return value is a list of (PROJECT-ROOT . SESSIONS) pairs."
                               (equal (file-truename (expand-file-name tf)) target))
                      buf)))))))
 
-(defun agent-pane-sessions--session-running-p (session)
-  "Return non-nil when SESSION currently has an active running agent job."
+(defun agent-pane-sessions--state-has-agent-output-p (state)
+  "Return non-nil when STATE has at least one non-user message."
+  (let ((msgs (and (listp state) (map-elt state :messages))))
+    (cl-some (lambda (m)
+               (memq (map-elt m :role)
+                     '(assistant thought tool system acp)))
+             msgs)))
+
+(defun agent-pane-sessions--session-status (session)
+  "Return live status symbol for SESSION.
+
+Possible values:
+- `running'       active ACP work in progress
+- `done'          idle and has produced agent output
+- `waiting-input' idle and waiting for user input
+- nil             no live chat buffer for this transcript"
   (let* ((file (plist-get session :file))
          (buf (and file (file-exists-p file)
                    (agent-pane-sessions--chat-buffer-for-transcript file))))
     (and buf
          (with-current-buffer buf
-           (let ((state (and (boundp 'agent-pane--state) agent-pane--state)))
-             (and (listp state)
-                  (or (map-elt state :connecting)
-                      (map-elt state :prompt-in-flight)
-                      (memq (map-elt state :in-progress)
-                            '(waiting streaming cancelling)))))))))
+           (let* ((state (and (boundp 'agent-pane--state) agent-pane--state))
+                  (in-progress (and (listp state) (map-elt state :in-progress)))
+                  (running (and (listp state)
+                                (or (map-elt state :connecting)
+                                    (map-elt state :prompt-in-flight)
+                                    (memq in-progress '(waiting streaming cancelling))
+                                    (consp (map-elt state :prompt-queue))))))
+             (cond
+              (running 'running)
+              ((agent-pane-sessions--state-has-agent-output-p state) 'done)
+              (t 'waiting-input)))))))
+
+(defun agent-pane-sessions--session-status-prefix (session)
+  "Return display prefix describing SESSION live status."
+  (pcase (agent-pane-sessions--session-status session)
+    ('running "[RUN] ")
+    ('done "[DONE] ")
+    ('waiting-input "[WAIT] ")
+    (_ "       ")))
 
 (defun agent-pane-sessions--format-session-line (session)
   "Format a SESSION plist for display line text."
@@ -353,9 +380,7 @@ Return value is a list of (PROJECT-ROOT . SESSIONS) pairs."
                                              agent-pane-sessions-preview-max-width
                                              nil nil "…")))
     (concat
-     (if (agent-pane-sessions--session-running-p session)
-         "● "
-       "  ")
+     (agent-pane-sessions--session-status-prefix session)
      (if (string-empty-p created-s)
          title*
        (format "%s (%s)" title* created-s))
@@ -386,7 +411,7 @@ Return value is a list of (PROJECT-ROOT . SESSIONS) pairs."
                                 visible-count
                                 all-count)
                         'face 'agent-pane-sessions-meta))
-    (insert (propertize "Keys: RET open/replay | o open .md | n new | / filter | c clear | s sort | r rename | C-k delete | TAB fold | g refresh | q exit | ● running\n\n"
+    (insert (propertize "Keys: RET open/replay | o open .md | n new | / filter | c clear | s sort | r rename | C-k delete | TAB fold | g refresh | q exit | [RUN]/[DONE]/[WAIT] live status\n\n"
                         'face 'agent-pane-sessions-meta))
     (if (null visible-groups)
         (insert (propertize "No sessions match current filter.\n" 'face 'agent-pane-sessions-meta))
@@ -459,6 +484,46 @@ Return value is a list of (PROJECT-ROOT . SESSIONS) pairs."
             "*agent-pane*")
           (file-name-base (or file "session"))))
 
+(defun agent-pane-sessions--chat-target-window ()
+  "Return preferred window for showing chat when sidebar is visible.
+
+When the sessions sidebar is present, prefer any other window on the same
+frame (usually the right pane in `agent-pane-app').  Return nil when no
+sidebar window is visible."
+  (let* ((sessions-buf (get-buffer agent-pane-sessions-buffer-name))
+         (sessions-win
+          (or (and sessions-buf
+                   (eq (current-buffer) sessions-buf)
+                   (window-live-p (selected-window))
+                   (eq (window-buffer (selected-window)) sessions-buf)
+                   (selected-window))
+              (and sessions-buf
+                   (car (get-buffer-window-list sessions-buf nil t))))))
+    (when (window-live-p sessions-win)
+      (let* ((frame (window-frame sessions-win))
+             (wins (window-list frame nil (frame-first-window frame))))
+        (or (cl-find-if (lambda (w)
+                          (and (window-live-p w)
+                               (not (window-minibuffer-p w))
+                               (not (eq w sessions-win))
+                               (with-current-buffer (window-buffer w)
+                                 (derived-mode-p 'agent-pane-mode))))
+                        wins)
+            (cl-find-if (lambda (w)
+                          (and (window-live-p w)
+                               (not (window-minibuffer-p w))
+                               (not (eq w sessions-win))))
+                        wins))))))
+
+(defun agent-pane-sessions--display-chat-buffer (buf)
+  "Display chat BUF without spawning extra windows when sidebar is visible."
+  (if-let ((win (agent-pane-sessions--chat-target-window)))
+      (progn
+        (set-window-buffer win buf)
+        (select-window win)
+        buf)
+    (pop-to-buffer buf)))
+
 (defun agent-pane-sessions--open-transcript-in-chat (file)
   "Open transcript FILE in a dedicated chat buffer as replayed messages."
   (let* ((meta (agent-pane-sessions--parse-transcript-metadata file))
@@ -470,7 +535,7 @@ Return value is a list of (PROJECT-ROOT . SESSIONS) pairs."
                   (get-buffer-create
                    (agent-pane-sessions--chat-buffer-name-for-transcript file)))))
     (require 'agent-pane)
-    (pop-to-buffer buf)
+    (agent-pane-sessions--display-chat-buffer buf)
     (with-current-buffer buf
       (setq default-directory
             (file-name-as-directory (expand-file-name (or root default-directory))))
@@ -606,7 +671,7 @@ Always creates a fresh chat buffer, leaving existing runs untouched."
                            "*agent-pane*")
                          proj))
            (buf (generate-new-buffer base)))
-      (pop-to-buffer buf)
+      (agent-pane-sessions--display-chat-buffer buf)
       (with-current-buffer buf
         (setq default-directory (file-name-as-directory (expand-file-name root)))
         (agent-pane-mode)

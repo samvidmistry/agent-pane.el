@@ -247,6 +247,60 @@
         (kill-buffer chat-buf))
       (ignore-errors (delete-directory dir t)))))
 
+(ert-deftest agent-pane-sessions-open-at-point-reuses-right-pane-when-sidebar-visible ()
+  (let* ((dir (make-temp-file "agent-pane-transcripts" t))
+         (agent-pane-transcript-directory dir)
+         (f (expand-file-name "20260101-010101--proj--aaaa1111.md" dir))
+         (sessions-buf (get-buffer-create agent-pane-sessions-buffer-name))
+         (scratch-right (get-buffer-create "*agent-pane right-pane*"))
+         pop-called)
+    (unwind-protect
+        (progn
+          (agent-pane-test--write
+           f
+           (string-join
+            '("# agent-pane transcript"
+              ""
+              "- created: 2026-01-01 01:01:01"
+              "- project_root: /tmp/proj"
+              ""
+              "---"
+              ""
+              "## User — 2026-01-01 01:01:02"
+              ""
+              "hello")
+            "\n"))
+          (save-window-excursion
+            (delete-other-windows)
+            (let* ((main (selected-window))
+                   (side (split-window main agent-pane-sessions-sidebar-width 'left)))
+              (set-window-buffer side sessions-buf)
+              (set-window-dedicated-p side t)
+              (set-window-buffer main scratch-right)
+              (with-current-buffer sessions-buf
+                (erase-buffer)
+                (insert "** session\n")
+                (add-text-properties (point-min) (point-max)
+                                     (list 'agent-pane-session-file f
+                                           'agent-pane-project-root "/tmp/proj"))
+                (goto-char (point-min))
+                (cl-letf (((symbol-function 'pop-to-buffer)
+                           (lambda (&rest _args)
+                             (setq pop-called t)
+                             nil)))
+                  (agent-pane-sessions-open-at-point)))
+              (should-not pop-called)
+              (should (eq (window-buffer side) sessions-buf))
+              (should (= (length (cl-remove-if #'window-minibuffer-p
+                                               (window-list)))
+                         2))
+              (with-current-buffer (window-buffer main)
+                (should (derived-mode-p 'agent-pane-mode))
+                (should (equal (map-elt agent-pane--state :transcript-file) f))))))
+      (ignore-errors (kill-buffer sessions-buf))
+      (ignore-errors (kill-buffer scratch-right))
+      (ignore-errors (delete-directory dir t)))))
+
 (ert-deftest agent-pane-sessions-open-at-point-keeps-existing-running-buffer ()
   (let* ((dir (make-temp-file "agent-pane-transcripts" t))
          (agent-pane-transcript-directory dir)
@@ -319,38 +373,58 @@
               (kill-buffer b))))
       (ignore-errors (delete-directory dir t)))))
 
-(ert-deftest agent-pane-sessions-running-indicator-renders-for-active-session ()
+(ert-deftest agent-pane-sessions-status-indicators-render-live-state ()
   (let* ((dir (make-temp-file "agent-pane-transcripts" t))
          (agent-pane-transcript-directory dir)
          (agent-pane-buffer-name "*agent-pane replay test*")
-         (f (expand-file-name "20260101-010101--proj--aaaa1111.md" dir))
-         (chat-buf nil))
+         (f-run (expand-file-name "20260101-010101--proj--run.md" dir))
+         (f-done (expand-file-name "20260102-010101--proj--done.md" dir))
+         (f-wait (expand-file-name "20260103-010101--proj--wait.md" dir))
+         (buf-run nil)
+         (buf-done nil)
+         (buf-wait nil))
     (unwind-protect
         (progn
-          (agent-pane-test--write
-           f
-           (string-join
-            '("# agent-pane transcript"
-              ""
-              "- created: 2026-01-01 01:01:01"
-              "- title: Running session"
-              "- project_root: /tmp/proj"
-              ""
-              "---")
-            "\n"))
-          (setq chat-buf (get-buffer-create "*agent-pane running-indicator*"))
-          (with-current-buffer chat-buf
+          (dolist (spec `((,f-run "Running session")
+                          (,f-done "Done session")
+                          (,f-wait "Waiting session")))
+            (agent-pane-test--write
+             (car spec)
+             (string-join
+              `(,"# agent-pane transcript"
+                ""
+                "- created: 2026-01-01 01:01:01"
+                ,(format "- title: %s" (cadr spec))
+                "- project_root: /tmp/proj"
+                ""
+                "---")
+              "\n")))
+          (setq buf-run (get-buffer-create "*agent-pane status-run*"))
+          (with-current-buffer buf-run
             (setq default-directory "/tmp/proj/")
             (agent-pane-mode)
-            (map-put! agent-pane--state :transcript-file f)
-            (map-put! agent-pane--state :in-progress 'waiting))
+            (map-put! agent-pane--state :transcript-file f-run)
+            (map-put! agent-pane--state :in-progress 'streaming))
+          (setq buf-done (get-buffer-create "*agent-pane status-done*"))
+          (with-current-buffer buf-done
+            (setq default-directory "/tmp/proj/")
+            (agent-pane-mode)
+            (map-put! agent-pane--state :transcript-file f-done)
+            (agent-pane--append-message* :role 'assistant :text "done"))
+          (setq buf-wait (get-buffer-create "*agent-pane status-wait*"))
+          (with-current-buffer buf-wait
+            (setq default-directory "/tmp/proj/")
+            (agent-pane-mode)
+            (map-put! agent-pane--state :transcript-file f-wait))
           (with-temp-buffer
             (agent-pane-sessions-mode)
-            (should (save-excursion
-                      (goto-char (point-min))
-                      (re-search-forward "^\\*\\* ● Running session" nil t)))))
-      (when (buffer-live-p chat-buf)
-        (kill-buffer chat-buf))
+            (let ((s (buffer-string)))
+              (should (string-match-p "^\\*\\* \\[RUN\\] Running session" s))
+              (should (string-match-p "^\\*\\* \\[DONE\\] Done session" s))
+              (should (string-match-p "^\\*\\* \\[WAIT\\] Waiting session" s)))))
+      (dolist (b (list buf-run buf-done buf-wait))
+        (when (buffer-live-p b)
+          (kill-buffer b)))
       (ignore-errors (delete-directory dir t)))))
 
 (ert-deftest agent-pane-sessions-filter-shows-matching-session ()

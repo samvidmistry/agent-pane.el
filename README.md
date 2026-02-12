@@ -2,6 +2,8 @@
 
 Build a Codex-app-like UI inside Emacs, implemented in Emacs Lisp.
 
+> Note: This entire project is vibe-coded with GPT-5.3-Codex.
+
 This repo vendors:
 
 - `vendor/acp.el/` for ACP (Agent Client Protocol) client support.
@@ -52,7 +54,7 @@ Auth/login UX is partial (actionable authenticate-failure guidance exists, full 
 Use `M-x customize-group RET agent-pane RET` or `C-c C-a` in chat buffer to switch.
 
 Model selection is configurable via `agent-pane-session-model-id`.
-Use `C-c C-m` in chat to set/clear it interactively; when a session is active,
+Use `C-c m` in chat to set/clear it interactively; when a session is active,
 agent-pane sends ACP `session/set_model` immediately.
 
 Diff review is configurable via:
@@ -61,6 +63,8 @@ Diff review is configurable via:
 
 ## Key bindings (chat buffer)
 
+- `C-c .` open command menu (transient dispatch)
+  - alias: `C-c C-.`
 - `C-c C-c` send
 - `C-c C-k` cancel
 - `C-c C-q` exit app (close chat + sessions buffers)
@@ -71,10 +75,14 @@ Diff review is configurable via:
 - `C-c C-r` show raw payload at point
 - `C-c C-a` switch ACP provider profile (codex/copilot/claude-code/custom)
 - `C-c v` toggle ACP header details (summary-only vs full debug)
-- `C-c C-m` set ACP model id (`session/set_model`; empty input clears preference)
-- `C-c C-d` view structured file-change diff at point (`diff-mode` or `ediff`)
-- `C-c C-o` toggle tool output mode (preview tail/full output)
-- `C-c C-i` open multiline input editor
+- `C-c m` set ACP model id (`session/set_model`; empty input clears preference)
+  - alias: `C-c C-m` (same as `C-c RET` in many terminals)
+- `C-c d` view structured file-change diff at point (`diff-mode` or `ediff`)
+  - alias: `C-c C-d`
+- `C-c o` toggle tool output mode (preview tail/full output)
+  - alias: `C-c C-o`
+- `C-c i` open multiline input editor
+  - alias: `C-c C-i`
 - `C-c C-y` copy last user prompt into input (edit-and-resend helper)
 - `C-c C-w` copy last tool output to clipboard
 - `C-c C-b` copy fenced code block body at point
@@ -84,7 +92,8 @@ Diff review is configurable via:
 
 ## Key bindings (sessions sidebar)
 
-- `RET` replay transcript into chat buffer
+- `RET` replay transcript into chat buffer (reuses right chat pane when sidebar is open)
+  - live status prefixes: `[RUN]`, `[DONE]`, `[WAIT]`
 - `o` open raw transcript `.md`
 - `n` new chat for project at point
 - `/` set filter, `c` clear filter

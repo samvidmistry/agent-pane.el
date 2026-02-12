@@ -24,6 +24,7 @@
 (require 'agent-pane-sessions)
 (require 'agent-pane-util)
 (require 'agent-pane-diff)
+(require 'agent-pane-dispatch)
 (require 'acp)
 (require 'map)
 (require 'subr-x)
@@ -34,6 +35,7 @@
 (defvar agent-pane--header-details-collapsed)
 (defvar-local agent-pane--tool-output-full-mode nil
   "When non-nil, tool output blocks render full output in this chat buffer.")
+(declare-function agent-pane--handshake "agent-pane-acp")
 (declare-function agent-pane--set-session-model "agent-pane-acp")
 (declare-function agent-pane--refresh-tool-call-messages "agent-pane-acp")
 (declare-function agent-pane--conversation-current-path-node-ids "agent-pane-state")
@@ -383,8 +385,19 @@ Otherwise copy the full tool message text."
         (insert text)
         (goto-char (point-max))))
     (pop-to-buffer buf)))
+(defun agent-pane--state-busy-p ()
+  "Return non-nil when current chat has an active ACP operation."
+  (let ((in-progress (map-elt agent-pane--state :in-progress)))
+    (or (map-elt agent-pane--state :connecting)
+        (map-elt agent-pane--state :prompt-in-flight)
+        (memq in-progress '(waiting streaming cancelling)))))
+
 (defun agent-pane-set-acp-provider (provider)
-  "Set ACP PROVIDER for new sessions and reset current connection state.
+  "Set ACP PROVIDER for this chat.
+
+If idle, switch immediately by reconnecting with PROVIDER.
+If a turn is running, preserve the current run and apply PROVIDER after it
+finishes.
 
 PROVIDER must be one of `codex', `copilot', `claude-code', or `custom'."
   (interactive
@@ -392,23 +405,34 @@ PROVIDER must be one of `codex', `copilot', `claude-code', or `custom'."
                                   '("codex" "copilot" "claude-code" "custom")
                                   nil t nil nil
                                   (symbol-name agent-pane-acp-provider)))))
+  (agent-pane--ensure-state)
   (setq agent-pane-acp-provider provider)
   (setq agent-pane-auth-method-id
         (pcase provider
           ('codex "chatgpt")
           ((or 'copilot 'claude-code) nil)
           (_ agent-pane-auth-method-id)))
-  (agent-pane--ensure-state)
-  ;; Force reconnect on next submit.
-  (map-put! agent-pane--state :client nil)
-  (map-put! agent-pane--state :session-id nil)
-  (map-put! agent-pane--state :subscribed nil)
-  (map-put! agent-pane--state :connecting nil)
-  (agent-pane--rerender)
-  (message "ACP provider set to %s" provider))
+  (if (agent-pane--state-busy-p)
+      (message "ACP provider set to %s (will apply after current run)" provider)
+    (when-let ((client (map-elt agent-pane--state :client)))
+      (ignore-errors (acp-shutdown :client client)))
+    (map-put! agent-pane--state :client nil)
+    (map-put! agent-pane--state :session-id nil)
+    (map-put! agent-pane--state :subscribed nil)
+    (map-put! agent-pane--state :connecting nil)
+    (map-put! agent-pane--state :resume-session-id nil)
+    (agent-pane--rerender)
+    (if (and agent-pane-enable-acp (not noninteractive))
+        (progn
+          (message "ACP provider set to %s (connecting...)" provider)
+          (agent-pane--handshake
+           (lambda ()
+             (agent-pane--rerender)
+             (message "ACP provider switched to %s for this chat" provider))))
+      (message "ACP provider set to %s" provider))))
 
 (defun agent-pane-set-session-model (model-id)
-  "Set ACP MODEL-ID preference and apply it to the active session.
+  "Set ACP MODEL-ID preference and apply it to the current chat session.
 When MODEL-ID is empty, clear the preference and use provider defaults for
 new sessions."
   (interactive
@@ -420,24 +444,31 @@ new sessions."
     (agent-pane--ensure-state)
     (if (null model-id*)
         (message "ACP model preference cleared (provider default for new sessions)")
-      (let ((client (map-elt agent-pane--state :client))
-            (session-id (map-elt agent-pane--state :session-id)))
-        (if (and client session-id)
-            (agent-pane--set-session-model
-             model-id*
-             (lambda (_resp)
-               (agent-pane--rerender)
-               (message "ACP model set to %s" model-id*))
-             (lambda (err &optional _raw)
-               (agent-pane--append-message
-                'system
-                (format "Warning: failed to set session model (%s): %s"
-                        model-id*
-                        (or (map-elt err 'message) err)))
-               (agent-pane--rerender)
-               (message "Failed to set ACP model: %s"
-                        (or (map-elt err 'message) err))))
-          (message "ACP model preference set to %s (applies to new sessions)" model-id*))))))
+      (let ((apply-model
+             (lambda ()
+               (agent-pane--set-session-model
+                model-id*
+                (lambda (_resp)
+                  (agent-pane--rerender)
+                  (message "ACP model set to %s" model-id*))
+                (lambda (err &optional _raw)
+                  (agent-pane--append-message
+                   'system
+                   (format "Warning: failed to set session model (%s): %s"
+                           model-id*
+                           (or (map-elt err 'message) err)))
+                  (agent-pane--rerender)
+                  (message "Failed to set ACP model: %s"
+                           (or (map-elt err 'message) err)))))))
+        (if (and (map-elt agent-pane--state :client)
+                 (map-elt agent-pane--state :session-id))
+            (funcall apply-model)
+          (if (and agent-pane-enable-acp (not noninteractive))
+              (progn
+                (message "Connecting ACP session to apply model %s..." model-id*)
+                (agent-pane--handshake apply-model))
+            (message "ACP model preference set to %s (applies to new sessions)"
+                     model-id*)))))))
 
 (defun agent-pane-toggle-header-details ()
   "Toggle verbose ACP header details in the current chat buffer."
@@ -530,12 +561,21 @@ sends it to Codex via ACP for a streamed response."
     (define-key m (kbd "C-c C-e") #'agent-pane-open-acp-stderr)
     (define-key m (kbd "C-c C-s") #'agent-pane-show-state)
     (define-key m (kbd "C-c C-r") #'agent-pane-show-raw-at-point)
+    (define-key m (kbd "C-c .") #'agent-pane-dispatch)
+    (define-key m (kbd "C-c C-.") #'agent-pane-dispatch)
     (define-key m (kbd "C-c C-a") #'agent-pane-set-acp-provider)
     (define-key m (kbd "C-c C-v") #'agent-pane-toggle-header-details)
     (define-key m (kbd "C-c v") #'agent-pane-toggle-header-details)
+    ;; `C-m' is RET in many terminals, so expose a plain-letter binding too.
+    (define-key m (kbd "C-c m") #'agent-pane-set-session-model)
     (define-key m (kbd "C-c C-m") #'agent-pane-set-session-model)
+    ;; Some terminals collapse control-key chords; provide plain-letter aliases.
+    (define-key m (kbd "C-c d") #'agent-pane-view-diff-at-point)
     (define-key m (kbd "C-c C-d") #'agent-pane-view-diff-at-point)
+    ;; Some terminals collapse C-o variants; provide both bindings.
+    (define-key m (kbd "C-c o") #'agent-pane-toggle-tool-output-mode)
     (define-key m (kbd "C-c C-o") #'agent-pane-toggle-tool-output-mode)
+    (define-key m (kbd "C-c i") #'agent-pane-edit-input)
     (define-key m (kbd "C-c C-i") #'agent-pane-edit-input)
     (define-key m (kbd "C-c C-y") #'agent-pane-copy-last-user-to-input)
     (define-key m (kbd "C-c C-w") #'agent-pane-copy-last-tool-output)
