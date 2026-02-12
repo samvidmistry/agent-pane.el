@@ -53,6 +53,10 @@ MESSAGES is a list of message alists."
           (cons :in-progress nil)
           ;; Pending user prompts that should be sent to the ACP session in order.
           (cons :prompt-queue nil)
+          ;; Message indexes aligned with `:prompt-queue' entries.
+          ;; Entries are either nil (not a queued-visible message) or a numeric
+          ;; user message index that should be unmarked from queued once sent.
+          (cons :prompt-queue-message-indices nil)
           (cons :prompt-in-flight nil)
           ;; Human-friendly session title (usually derived from the first user turn).
           (cons :session-title nil)
@@ -68,10 +72,15 @@ MESSAGES is a list of message alists."
           (cons :session-new-result nil)
           (cons :session-mode-result nil)
           (cons :session-model-result nil)
+          (cons :session-config-options nil)
+          (cons :available-model-ids nil)
+          (cons :current-model-id nil)
           (cons :last-prompt-result nil)
           ;; Transcript.
           (cons :transcript-file nil)
           (cons :transcript-session-id-logged nil)
+          ;; Number of messages already seen by the user in this buffer.
+          (cons :session-seen-message-count (length msgs))
           ;; Resume support.
           (cons :resume-session-id nil)
           ;; Tool calls and permissions.
@@ -164,6 +173,9 @@ so we must check key presence, not value truthiness."
                (map-contains-key agent-pane--state :client)
                (hash-table-p (map-elt agent-pane--state :tool-calls)))
     (setq-local agent-pane--state (agent-pane--make-state)))
+  (unless (map-contains-key agent-pane--state :session-seen-message-count)
+    (map-put! agent-pane--state :session-seen-message-count
+              (length (or (map-elt agent-pane--state :messages) nil))))
   (unless (and (hash-table-p (map-elt agent-pane--state :conversation-nodes))
                (integerp (map-elt agent-pane--state :conversation-head))
                (integerp (map-elt agent-pane--state :conversation-next-id)))
@@ -183,7 +195,8 @@ RAW is an optional elisp object attached for inspection."
   (let ((msg (list (cons :role role)
                    (cons :text (or text ""))
                    (cons :title title)
-                   (cons :raw raw))))
+                   (cons :raw raw)
+                   (cons :queued nil))))
     (agent-pane--conversation-append-message msg)))
 (defun agent-pane--append-message (role text)
   "Append a message with ROLE and TEXT to state and return its index."
@@ -218,5 +231,23 @@ RAW is an optional elisp object attached for inspection."
     (when msg
       ;; Keep the key even if RAW is nil.
       (map-put! msg :raw raw))))
+
+(defun agent-pane--set-message-queued (idx queuedp)
+  "Set queued flag for message at IDX to QUEUEDP."
+  (agent-pane--ensure-state)
+  (let* ((msgs (map-elt agent-pane--state :messages))
+         (msg (nth idx msgs)))
+    (when msg
+      (map-put! msg :queued (and queuedp t)))))
+
+(defun agent-pane--mark-thread-seen ()
+  "Mark all current messages in this chat buffer as seen by the user."
+  (agent-pane--ensure-state)
+  (let ((seen (or (map-elt agent-pane--state :session-seen-message-count) 0))
+        (count (length (or (map-elt agent-pane--state :messages) nil))))
+    (when (/= seen count)
+      (map-put! agent-pane--state :session-seen-message-count count)
+      t)))
+
 (provide 'agent-pane-state)
 ;;; agent-pane-state.el ends here

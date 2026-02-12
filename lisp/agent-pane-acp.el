@@ -24,10 +24,12 @@
 (defvar agent-pane-permission-rules-file)
 (defvar agent-pane-acp-provider)
 (defvar agent-pane-session-model-id)
+(defvar agent-pane-acp-request-timeout-seconds)
 (defvar agent-pane-permission-review-diff)
 (defvar agent-pane--tool-output-full-mode)
 (declare-function agent-pane--acp-command-and-params "agent-pane-util")
 (declare-function agent-pane--acp-environment "agent-pane-util")
+(declare-function agent-pane--set-message-queued "agent-pane-state")
 (defvar agent-pane--permission-project-rules-cache :uninitialized
   "Cached project permission rules loaded from `agent-pane-permission-rules-file'.")
 (defun agent-pane--append-acp-event (text &optional raw)
@@ -94,47 +96,75 @@ append a system message."
                    :command cmd
                    :command-params params
                    :environment-variables (agent-pane--acp-environment)))))))
-(cl-defun agent-pane--acp-send-request (&key client request buffer on-success on-failure)
+(cl-defun agent-pane--acp-send-request
+    (&key client request buffer on-success on-failure timeout-seconds)
   "Send an ACP REQUEST using CLIENT.
 If CLIENT is a fake (marked with `:agent-pane-fake'), avoid starting external
-processes and call the client request sender directly."
+processes and call the client request sender directly.
+When TIMEOUT-SECONDS is a positive number, run ON-FAILURE if no response
+arrives before the timeout."
   (unless client
     (error "Missing required argument: :client"))
   (unless request
     (error "Missing required argument: :request"))
-  (agent-pane--append-acp-event
-   (format "→ %s" (map-elt request :method))
-   request)
-  (let ((wrapped-success
-         (lambda (resp)
-           (agent-pane--append-acp-event
-            (format "← %s (ok)" (map-elt request :method))
-            resp)
-           (when (functionp on-success)
-             (funcall on-success resp))))
-        (wrapped-failure
-         (lambda (err &optional raw)
-           (agent-pane--append-acp-event
-            (format "← %s (error): %s" (map-elt request :method) (or (map-elt err 'message) err))
-            (or raw err))
-           (when (functionp on-failure)
-             (let ((arity (cdr (func-arity on-failure))))
-               (if (>= arity 2)
-                   (funcall on-failure err raw)
-                 (funcall on-failure err)))))))
+  (let* ((method (map-elt request :method))
+         (done nil)
+         timer
+         (finish-success
+          (lambda (resp)
+            (unless done
+              (setq done t)
+              (when timer
+                (cancel-timer timer))
+              (agent-pane--append-acp-event
+               (format "← %s (ok)" method)
+               resp)
+              (when (functionp on-success)
+                (funcall on-success resp)))))
+         (finish-failure
+          (lambda (err &optional raw)
+            (unless done
+              (setq done t)
+              (when timer
+                (cancel-timer timer))
+              (agent-pane--append-acp-event
+               (format "← %s (error): %s" method (or (map-elt err 'message) err))
+               (or raw err))
+              (when (functionp on-failure)
+                (let ((arity (cdr (func-arity on-failure))))
+                  (if (>= arity 2)
+                      (funcall on-failure err raw)
+                    (funcall on-failure err))))))))
+    (agent-pane--append-acp-event
+     (format "→ %s" method)
+     request)
+    (when (and (numberp timeout-seconds)
+               (> timeout-seconds 0))
+      (setq timer
+            (run-at-time
+             timeout-seconds
+             nil
+             (lambda ()
+               (funcall finish-failure
+                        `((message . ,(format "%s timed out after %ss"
+                                              method
+                                              timeout-seconds))
+                          (code . "request_timeout")
+                          (method . ,method)
+                          (timeoutSeconds . ,timeout-seconds)))))))
     (if (map-elt client :agent-pane-fake)
         ;; Fake sender does not accept :buffer or :sync.
         (funcall (map-elt client :request-sender)
                  :client client
                  :request request
-                 :on-success wrapped-success
-                 :on-failure wrapped-failure)
+                 :on-success finish-success
+                 :on-failure finish-failure)
       (acp-send-request
        :client client
        :request request
        :buffer buffer
-       :on-success wrapped-success
-       :on-failure wrapped-failure))))
+       :on-success finish-success
+       :on-failure finish-failure))))
 (cl-defun agent-pane--acp-send-notification (&key client notification)
   "Send an ACP NOTIFICATION using CLIENT.
 If CLIENT is fake (marked with `:agent-pane-fake'), call the client's
@@ -196,10 +226,208 @@ directly (fake clients typically no-op)."
      :buffer (current-buffer)
      :on-request (lambda (request)
                    (agent-pane--on-request request)))))
+
+(defun agent-pane--map-elt-safe (obj key)
+  "Return OBJ value at KEY, or nil when OBJ is not map-like."
+  (condition-case nil
+      (map-elt obj key)
+    (error nil)))
+
+(defun agent-pane--map-nested-elt-safe (obj keys)
+  "Return nested OBJ value at KEYS, or nil on shape mismatch."
+  (condition-case nil
+      (map-nested-elt obj keys)
+    (error nil)))
+
+(defun agent-pane--map-contains-key-safe (obj key)
+  "Return non-nil when OBJ is map-like and has KEY."
+  (condition-case nil
+      (map-contains-key obj key)
+    (error nil)))
+
+(defun agent-pane--nonempty-value-p (value)
+  "Return non-nil when VALUE has meaningful content."
+  (cond
+   ((null value) nil)
+   ((stringp value) (not (string-empty-p (string-trim value))))
+   ((vectorp value) (> (length value) 0))
+   ((listp value) (not (null value)))
+   (t t)))
+
+(defun agent-pane--first-nonempty-value (values)
+  "Return the first non-empty entry from VALUES, or nil."
+  (cl-loop for value in values
+           when (agent-pane--nonempty-value-p value)
+           return value))
+
+(defun agent-pane--normalize-nonempty-string (value)
+  "Return VALUE as a trimmed non-empty string, or nil."
+  (when (stringp value)
+    (let ((trimmed (string-trim value)))
+      (unless (string-empty-p trimmed)
+        trimmed))))
+
+(defun agent-pane--dedupe-strings (values)
+  "Return VALUES without duplicates, preserving order."
+  (let ((seen (make-hash-table :test 'equal))
+        out)
+    (dolist (value values (nreverse out))
+      (when (and (stringp value)
+                 (not (gethash value seen)))
+        (puthash value t seen)
+        (push value out)))))
+
+(defun agent-pane--model-id-from-option (option)
+  "Return a model id string from ACP config OPTION, or nil."
+  (cond
+   ((stringp option)
+    (agent-pane--normalize-nonempty-string option))
+   ((listp option)
+    (agent-pane--normalize-nonempty-string
+     (agent-pane--first-nonempty-value
+      (list (agent-pane--map-elt-safe option 'value)
+            (agent-pane--map-elt-safe option 'id)
+            (agent-pane--map-elt-safe option 'modelId)
+            (agent-pane--map-elt-safe option 'model_id)))))
+   (t nil)))
+
+(defun agent-pane--model-id-from-entry (entry)
+  "Return a model id string from model ENTRY, or nil."
+  (cond
+   ((stringp entry)
+    (agent-pane--normalize-nonempty-string entry))
+   ((listp entry)
+    (agent-pane--normalize-nonempty-string
+     (agent-pane--first-nonempty-value
+      (list (agent-pane--map-elt-safe entry 'id)
+            (agent-pane--map-elt-safe entry 'modelId)
+            (agent-pane--map-elt-safe entry 'model_id)
+            (agent-pane--map-elt-safe entry 'value)))))
+   (t nil)))
+
+(defun agent-pane--extract-model-metadata (payload)
+  "Extract model metadata from ACP PAYLOAD.
+Return plist keys:
+- `:has-config-options' when `configOptions' is present.
+- `:config-options' raw config options (or nil).
+- `:has-model-fields' when model metadata fields are present.
+- `:ids' normalized model id list.
+- `:current' normalized current model id (or nil)."
+  (let* ((has-config-options
+          (agent-pane--map-contains-key-safe payload 'configOptions))
+         (config-options
+          (agent-pane--map-elt-safe payload 'configOptions))
+         (model-ids nil)
+         (current-model-id nil))
+    (dolist (cfg (agent-pane--listify config-options))
+      (let* ((cfg-id (agent-pane--normalize-nonempty-string
+                      (agent-pane--map-elt-safe cfg 'id)))
+             (category (agent-pane--normalize-nonempty-string
+                        (agent-pane--map-elt-safe cfg 'category)))
+             (is-model-option (or (equal cfg-id "model")
+                                  (equal category "model"))))
+        (when is-model-option
+          (let ((current
+                 (agent-pane--normalize-nonempty-string
+                  (agent-pane--first-nonempty-value
+                   (list (agent-pane--map-elt-safe cfg 'currentValue)
+                         (agent-pane--map-elt-safe cfg 'current_value)
+                         (agent-pane--map-elt-safe cfg 'value))))))
+            (when current
+              (push current model-ids)
+              (unless current-model-id
+                (setq current-model-id current))))
+          (dolist (option (agent-pane--listify
+                           (agent-pane--first-nonempty-value
+                            (list (agent-pane--map-elt-safe cfg 'options)
+                                  (agent-pane--map-elt-safe cfg 'values)
+                                  (agent-pane--map-elt-safe cfg 'allowedValues)))))
+            (when-let ((id (agent-pane--model-id-from-option option)))
+              (push id model-ids))))))
+    (let* ((models (agent-pane--map-elt-safe payload 'models))
+           (has-model-fields
+            (or (agent-pane--map-contains-key-safe payload 'models)
+                (agent-pane--map-contains-key-safe payload 'available_models)
+                (agent-pane--map-contains-key-safe payload 'availableModels)
+                (agent-pane--map-contains-key-safe payload 'current_model_id)
+                (agent-pane--map-contains-key-safe payload 'currentModelId)
+                (agent-pane--map-contains-key-safe models 'available_models)
+                (agent-pane--map-contains-key-safe models 'availableModels)
+                (agent-pane--map-contains-key-safe models 'current_model_id)
+                (agent-pane--map-contains-key-safe models 'currentModelId)))
+           (current
+            (agent-pane--normalize-nonempty-string
+             (agent-pane--first-nonempty-value
+              (list (agent-pane--map-elt-safe payload 'current_model_id)
+                    (agent-pane--map-elt-safe payload 'currentModelId)
+                    (agent-pane--map-elt-safe models 'current_model_id)
+                    (agent-pane--map-elt-safe models 'currentModelId)))))
+           (available
+            (agent-pane--first-nonempty-value
+             (list (agent-pane--map-elt-safe payload 'available_models)
+                   (agent-pane--map-elt-safe payload 'availableModels)
+                   (agent-pane--map-elt-safe models 'available_models)
+                   (agent-pane--map-elt-safe models 'availableModels)))))
+      (when current
+        (push current model-ids)
+        (unless current-model-id
+          (setq current-model-id current)))
+      (dolist (entry (agent-pane--listify available))
+        (when-let ((id (agent-pane--model-id-from-entry entry)))
+          (push id model-ids)))
+      (list :has-config-options has-config-options
+            :config-options config-options
+            :has-model-fields has-model-fields
+            :ids (agent-pane--dedupe-strings (nreverse model-ids))
+            :current current-model-id))))
+
+(defun agent-pane--update-model-metadata (payload)
+  "Update model-related state fields from ACP PAYLOAD."
+  (let* ((meta (agent-pane--extract-model-metadata payload))
+         (has-config-options (plist-get meta :has-config-options))
+         (has-model-fields (plist-get meta :has-model-fields))
+         (ids (plist-get meta :ids))
+         (current (plist-get meta :current)))
+    (when has-config-options
+      (map-put! agent-pane--state :session-config-options
+                (plist-get meta :config-options)))
+    (when (or has-config-options has-model-fields)
+      (map-put! agent-pane--state :available-model-ids ids)
+      (map-put! agent-pane--state :current-model-id current))))
+
+(defun agent-pane--available-model-ids ()
+  "Return known ACP model ids for the current chat buffer."
+  (agent-pane--ensure-state)
+  (agent-pane--listify (map-elt agent-pane--state :available-model-ids)))
+
+(defun agent-pane--tool-call-content-items (content)
+  "Normalize tool call CONTENT into a list of content items."
+  (cond
+   ((null content) nil)
+   ((vectorp content) (append content nil))
+   ((stringp content) (list content))
+   ;; List of content entries.
+   ((and (listp content)
+         (listp (car-safe content))
+         (or (null (car content))
+             (consp (car (car content)))
+             (keywordp (car (car content)))))
+    content)
+   ((listp content) (list content))
+   (t (list content))))
+
+(defun agent-pane--content-field-text (obj keys)
+  "Return textual representation for first non-empty KEY in KEYS from OBJ."
+  (let ((value
+         (agent-pane--first-nonempty-value
+          (mapcar (lambda (key) (agent-pane--map-elt-safe obj key)) keys))))
+    (when value
+      (agent-pane--tool-call-content->string value))))
+
 (defun agent-pane--tool-call-content->string (content)
   "Format tool call CONTENT into a plain string.
 Structured diff entries are omitted from textual output and handled separately."
-  (let ((items (agent-pane--listify content)))
+  (let ((items (agent-pane--tool-call-content-items content)))
     (string-join
      (delq nil
            (mapcar
@@ -209,24 +437,133 @@ Structured diff entries are omitted from textual output and handled separately."
                ((stringp item) item)
                ;; Avoid dumping structured diff objects into tool output text.
                ((and (listp item)
-                     (equal (map-elt item 'type) "diff"))
+                     (equal (agent-pane--map-elt-safe item 'type) "diff"))
                 nil)
-               ((stringp (map-nested-elt item '(content text)))
-                (map-nested-elt item '(content text)))
-               ((stringp (map-elt item 'text))
-                (map-elt item 'text))
+               ((stringp (agent-pane--map-nested-elt-safe item '(content text)))
+                (agent-pane--map-nested-elt-safe item '(content text)))
+               ((stringp (agent-pane--map-elt-safe item 'text))
+                (agent-pane--map-elt-safe item 'text))
+               ((stringp (agent-pane--map-elt-safe item 'thinkingText))
+                (agent-pane--map-elt-safe item 'thinkingText))
+               ((stringp (agent-pane--map-elt-safe item 'message))
+                (agent-pane--map-elt-safe item 'message))
+               ((let ((fallback
+                       (agent-pane--content-field-text
+                        item
+                        '(summary thinking reasoning body delta output result))))
+                  (and (stringp fallback)
+                       (not (string-empty-p (string-trim fallback)))
+                       fallback)))
                ;; Some servers put the text under (content (text . "..."))
-               ((let ((c (and (listp item) (map-elt item 'content))))
+               ((let ((c (and (listp item) (agent-pane--map-elt-safe item 'content))))
                   (cond
                    ((stringp c) c)
-                   ((and (listp c) (equal (map-elt c 'type) "diff")) nil)
-                   ((and (listp c) (stringp (map-elt c 'text)))
-                    (map-elt c 'text))
+                   ((and (listp c) (equal (agent-pane--map-elt-safe c 'type) "diff")) nil)
+                   ((and (listp c) (stringp (agent-pane--map-elt-safe c 'text)))
+                    (agent-pane--map-elt-safe c 'text))
                    ((null c) nil)
-                   (t (agent-pane--pp-to-string c)))))
+                   (t (agent-pane--tool-call-content->string c)))))
                (t (agent-pane--pp-to-string item))))
             items))
      "\n\n")))
+
+(defun agent-pane--session-update-content->text (update)
+  "Extract text content from session UPDATE.
+Handles wrapped list/vector payload forms used by different ACP providers."
+  (let* ((direct-text
+          (agent-pane--first-nonempty-value
+           (list (agent-pane--map-elt-safe update 'text)
+                 (agent-pane--map-elt-safe update 'thinkingText)
+                 (agent-pane--map-elt-safe update 'message)
+                 (agent-pane--map-elt-safe update 'summary))))
+         (content (agent-pane--map-elt-safe update 'content))
+         (text (or (and (stringp direct-text) direct-text)
+                   (and content
+                        (agent-pane--tool-call-content->string content)))))
+    (when (and (stringp text)
+               (not (string-empty-p (string-trim text))))
+      text)))
+
+(defun agent-pane--tool-raw-input (update)
+  "Return raw input payload from UPDATE, if present."
+  (or (agent-pane--map-elt-safe update 'rawInput)
+      (agent-pane--map-elt-safe update 'raw_input)
+      (agent-pane--map-elt-safe update 'input)))
+
+(defun agent-pane--tool-raw-input-command (update)
+  "Return tool command from UPDATE raw input when available."
+  (let ((raw-input (agent-pane--tool-raw-input update)))
+    (agent-pane--first-nonempty-value
+     (list (agent-pane--map-elt-safe raw-input 'command)
+           (agent-pane--map-elt-safe raw-input 'tool)
+           (agent-pane--map-elt-safe raw-input 'name)
+           (agent-pane--map-nested-elt-safe raw-input '(parameters command))
+           (agent-pane--map-nested-elt-safe raw-input '(params command))
+           (agent-pane--map-nested-elt-safe raw-input '(arguments command))
+           (agent-pane--map-nested-elt-safe raw-input '(args command))
+           (agent-pane--map-nested-elt-safe raw-input '(input command))))))
+
+(defun agent-pane--tool-raw-input-description (update)
+  "Return tool description from UPDATE raw input when available."
+  (let ((raw-input (agent-pane--tool-raw-input update)))
+    (agent-pane--first-nonempty-value
+     (list (agent-pane--map-elt-safe raw-input 'description)
+           (agent-pane--map-elt-safe raw-input 'desc)
+           (agent-pane--map-nested-elt-safe raw-input '(parameters description))
+           (agent-pane--map-nested-elt-safe raw-input '(params description))
+           (agent-pane--map-nested-elt-safe raw-input '(arguments description))
+           (agent-pane--map-nested-elt-safe raw-input '(args description))
+           (agent-pane--map-nested-elt-safe raw-input '(input description))))))
+
+(defun agent-pane--tool-raw-input-extra-params (raw-input)
+  "Return RAW-INPUT fields that look like tool parameters."
+  (let ((pairs
+         (cond
+          ((and (listp raw-input)
+                (consp (car-safe raw-input))
+                (symbolp (caar raw-input)))
+           raw-input)
+          ((and (consp raw-input)
+                (symbolp (car raw-input)))
+           (list raw-input))
+          (t nil))))
+    (when pairs
+      (let ((filtered
+             (cl-remove-if
+              (lambda (pair)
+                (memq (car-safe pair)
+                      '(command description desc tool name title kind type)))
+              pairs)))
+        (when (agent-pane--nonempty-value-p filtered)
+          filtered)))))
+
+(defun agent-pane--tool-raw-input-params (update)
+  "Extract structured tool parameters from UPDATE raw input."
+  (let* ((raw-input (agent-pane--tool-raw-input update))
+         (explicit
+          (agent-pane--first-nonempty-value
+           (list (agent-pane--map-elt-safe raw-input 'parameters)
+                 (agent-pane--map-elt-safe raw-input 'params)
+                 (agent-pane--map-elt-safe raw-input 'arguments)
+                 (agent-pane--map-elt-safe raw-input 'args)
+                 (agent-pane--map-elt-safe raw-input 'input))))
+         (extra (agent-pane--tool-raw-input-extra-params raw-input)))
+    (or explicit
+        extra
+        (and (stringp raw-input)
+             (not (string-empty-p (string-trim raw-input)))
+             raw-input))))
+
+(defun agent-pane--tool-params->string (params)
+  "Format tool invocation PARAMS into display text."
+  (cond
+   ((null params) nil)
+   ((stringp params)
+    (let ((trimmed (string-trim params)))
+      (unless (string-empty-p trimmed)
+        trimmed)))
+   (t (agent-pane--pp-to-string params))))
+
 (defun agent-pane--format-locations (locations)
   "Format LOCATIONS (ACP locations list) as a compact string."
   (let ((locs (agent-pane--listify locations)))
@@ -236,21 +573,53 @@ Structured diff entries are omitted from textual output and handled separately."
                      (or (map-elt loc 'path)
                          (map-elt loc 'uri)
                          (and loc (agent-pane--pp-to-string loc))))
-                   locs))
+                    locs))
      ", ")))
+
+(defun agent-pane--opaque-tool-call-id-p (value)
+  "Return non-nil when VALUE is an opaque call id."
+  (and (stringp value)
+       (string-match-p (rx string-start (or "call_" "call-") (+ any) string-end)
+                       value)))
+
+(defun agent-pane--tool-entry-command (entry)
+  "Return best-effort command string extracted from tool-call ENTRY."
+  (let* ((cmd0 (and (stringp (plist-get entry :command))
+                    (string-trim (plist-get entry :command))))
+         (params (plist-get entry :params)))
+    (or (and cmd0 (not (string-empty-p cmd0)) cmd0)
+        (and (listp params)
+             (agent-pane--first-nonempty-value
+              (list (agent-pane--map-elt-safe params 'command)
+                    (agent-pane--map-elt-safe params 'tool)
+                    (agent-pane--map-elt-safe params 'name)
+                    (agent-pane--map-nested-elt-safe params '(input command))
+                    (agent-pane--map-nested-elt-safe params '(args command))
+                    (agent-pane--map-nested-elt-safe params '(arguments command))
+                    (agent-pane--map-nested-elt-safe params '(params command))
+                    (agent-pane--map-nested-elt-safe params '(parameters command))))))))
+
+(defun agent-pane--tool-entry-label (entry)
+  "Return best-effort short label extracted from tool-call ENTRY."
+  (let* ((id (or (plist-get entry :toolCallId) ""))
+         (title0 (string-trim (or (plist-get entry :title) "")))
+         (kind0 (string-trim (or (plist-get entry :kind) "")))
+         (title (and (not (string-empty-p title0))
+                     (not (equal title0 id))
+                     (not (agent-pane--opaque-tool-call-id-p title0))
+                     title0))
+         (kind (and (not (string-empty-p kind0)) kind0)))
+    (or title kind)))
+
 (defun agent-pane--tool-call-display-title (entry)
   "Return a compact tool-call title for ENTRY.
 This is what we show in the UI label after `Tool'.
 Prefer showing the command (or `tool: command') over opaque ids like
 `call_...'."
   (let* ((id (or (plist-get entry :toolCallId) ""))
-         (title0 (string-trim (or (plist-get entry :title) "")))
-         (title (if (or (string-empty-p title0)
-                        (equal title0 id)
-                        (string-match-p (rx string-start (or "call_" "call-")) title0))
-                    ""
-                  title0))
-         (cmd (string-trim (or (plist-get entry :command) ""))))
+         (title (or (agent-pane--tool-entry-label entry) ""))
+         (cmd0 (agent-pane--tool-entry-command entry))
+         (cmd (if (stringp cmd0) (string-trim cmd0) "")))
     (cond
      ((and (not (string-empty-p title)) (not (string-empty-p cmd)))
       (if (string-match-p (regexp-quote cmd) title)
@@ -258,6 +627,7 @@ Prefer showing the command (or `tool: command') over opaque ids like
         (format "%s: %s" title cmd)))
      ((not (string-empty-p cmd)) cmd)
      ((not (string-empty-p title)) title)
+     ((agent-pane--opaque-tool-call-id-p id) "tool call")
      (t id))))
 (defvar agent-pane-tool-output-preview-lines)
 
@@ -272,12 +642,28 @@ Prefer showing the command (or `tool: command') over opaque ids like
     (list :tail (string-join tail "\n")
           :omitted omitted)))
 
+(defun agent-pane--merge-tool-output (existing incoming)
+  "Merge EXISTING tool output with INCOMING chunk or snapshot.
+
+When INCOMING looks like a full snapshot (starts with EXISTING), use it.
+When INCOMING is a true suffix chunk, append it.
+Empty INCOMING keeps EXISTING unchanged."
+  (let ((old (or existing ""))
+        (new (or incoming "")))
+    (cond
+     ((string-empty-p new) old)
+     ((string-empty-p old) new)
+     ((string-prefix-p old new) new)
+     ((string-prefix-p new old) old)
+     (t (concat old new)))))
+
 (defun agent-pane--tool-invocation-string (entry)
   "Return concise invocation text for tool-call ENTRY."
-  (let* ((tool (string-trim (or (plist-get entry :title)
-                                (plist-get entry :kind)
-                                "tool")))
-         (args (string-trim (or (plist-get entry :command)
+  (let* ((tool0 (or (agent-pane--tool-entry-label entry)
+                    "tool"))
+         (tool (string-trim tool0))
+         (cmd0 (agent-pane--tool-entry-command entry))
+         (args (string-trim (or cmd0
                                 (plist-get entry :description)
                                 ""))))
     (if (string-empty-p args)
@@ -288,6 +674,7 @@ Prefer showing the command (or `tool: command') over opaque ids like
   "Render a concise tool-call ENTRY plist as a message text.
 When FORCE-FULL-OUTPUT is non-nil, include the complete output body."
   (let* ((diff (plist-get entry :diff))
+         (params (agent-pane--tool-params->string (plist-get entry :params)))
          (output (string-trim-right (or (plist-get entry :output) "")))
          (show-full (or force-full-output agent-pane--tool-output-full-mode))
          (preview (unless show-full
@@ -298,6 +685,8 @@ When FORCE-FULL-OUTPUT is non-nil, include the complete output body."
      (string-join
       (delq nil
             (list (format "tool: %s" (agent-pane--tool-invocation-string entry))
+                  (when params
+                    (concat "params:\n" params))
                   (when diff
                     (format "changes: %s (view: C-c C-d)"
                             (agent-pane--diff-summary diff)))
@@ -356,15 +745,18 @@ Return a cons cell (IDX . CREATEDP)."
              (kind (map-elt update 'sessionUpdate))
              (prev-kind (map-elt agent-pane--state :last-session-update-kind)))
         (map-put! agent-pane--state :last-notification-session-id sid)
-        ;; If we were waiting for the agent, flip to streaming on first update.
-        (when (eq (map-elt agent-pane--state :in-progress) 'waiting)
+        ;; Only transition to streaming for updates tied to an in-flight prompt.
+        ;; Codex can emit session updates during handshake (for example config
+        ;; updates) before the first prompt is sent.
+        (when (and (eq (map-elt agent-pane--state :in-progress) 'waiting)
+                   (map-elt agent-pane--state :prompt-in-flight))
           (map-put! agent-pane--state :in-progress 'streaming)
           (agent-pane--ui-update-status-line))
         (map-put! agent-pane--state :last-session-update-kind kind)
         (cond
          ;; Agent message chunks (main visible output).
          ((equal kind "agent_message_chunk")
-          (let* ((text (map-nested-elt update '(content text)))
+          (let* ((text (agent-pane--session-update-content->text update))
                  (idx (map-elt agent-pane--state :streaming-assistant-index)))
             (when (stringp text)
               ;; Create a new assistant message when starting a new chunk group.
@@ -383,7 +775,7 @@ Return a cons cell (IDX . CREATEDP)."
          ;; Agent thought chunks (debug / reasoning stream).
          ((equal kind "agent_thought_chunk")
           (when agent-pane-show-thoughts
-            (let* ((text (map-nested-elt update '(content text)))
+            (let* ((text (agent-pane--session-update-content->text update))
                    (idx (map-elt agent-pane--state :streaming-thought-index)))
               (when (stringp text)
                 (unless (and (numberp idx)
@@ -401,7 +793,7 @@ Return a cons cell (IDX . CREATEDP)."
                   (agent-pane--transcript-append text))))))
          ;; Server-provided user echo.
          ((equal kind "user_message_chunk")
-          (let ((text (map-nested-elt update '(content text))))
+          (let ((text (agent-pane--session-update-content->text update)))
             (when (stringp text)
               (agent-pane--append-message* :role 'user :title "server" :text text :raw update)
               (agent-pane--ui-sync-transcript)
@@ -417,19 +809,22 @@ Return a cons cell (IDX . CREATEDP)."
                    (title (map-elt update 'title))
                    (status (map-elt update 'status))
                    (tool-kind (map-elt update 'kind))
-                   (command (map-nested-elt update '(rawInput command)))
-                   (desc (map-nested-elt update '(rawInput description)))
+                   (command (agent-pane--tool-raw-input-command update))
+                   (desc (agent-pane--tool-raw-input-description update))
+                   (params (agent-pane--tool-raw-input-params update))
                    (locations (map-elt update 'locations))
                    (diff (agent-pane--extract-diff-info update)))
               (setq entry (plist-put entry :toolCallId id))
               (setq entry (plist-put entry :title title))
               (setq entry (plist-put entry :status status))
               (setq entry (plist-put entry :kind tool-kind))
-              (setq entry (plist-put entry :command command))
-              (setq entry (plist-put entry :description desc))
-              (setq entry (plist-put entry :locations locations))
-              (when diff
-                (setq entry (plist-put entry :diff diff)))
+               (setq entry (plist-put entry :command command))
+               (setq entry (plist-put entry :description desc))
+               (when params
+                 (setq entry (plist-put entry :params params)))
+               (setq entry (plist-put entry :locations locations))
+               (when diff
+                 (setq entry (plist-put entry :diff diff)))
               (setq entry (plist-put entry :raw update))
               (puthash id entry tool-table)
               (pcase-let* ((`(,idx . ,created) (agent-pane--upsert-tool-call-message id))
@@ -452,15 +847,24 @@ Return a cons cell (IDX . CREATEDP)."
                    (status (map-elt update 'status))
                    (content (map-elt update 'content))
                    (output (agent-pane--tool-call-content->string content))
-                   (command (map-nested-elt update '(rawInput command)))
+                   (command (agent-pane--tool-raw-input-command update))
+                   (desc (agent-pane--tool-raw-input-description update))
+                   (params (agent-pane--tool-raw-input-params update))
                    (diff (agent-pane--extract-diff-info update)))
-              (setq entry (plist-put entry :toolCallId id))
-              (setq entry (plist-put entry :status status))
-              (when command
-                (setq entry (plist-put entry :command command)))
-              (when diff
-                (setq entry (plist-put entry :diff diff)))
-              (setq entry (plist-put entry :output (string-trim output)))
+               (setq entry (plist-put entry :toolCallId id))
+               (setq entry (plist-put entry :status status))
+               (when command
+                 (setq entry (plist-put entry :command command)))
+               (when desc
+                 (setq entry (plist-put entry :description desc)))
+               (when params
+                 (setq entry (plist-put entry :params params)))
+               (when diff
+                 (setq entry (plist-put entry :diff diff)))
+              (setq entry (plist-put entry :output
+                                     (agent-pane--merge-tool-output
+                                      (plist-get entry :output)
+                                      output)))
               (setq entry (plist-put entry :raw update))
               ;; If the tool call finished, log once to transcript.
               (when (and (stringp status)
@@ -501,6 +905,20 @@ Return a cons cell (IDX . CREATEDP)."
             (agent-pane--append-message* :role 'acp
                                          :title "available_commands_update"
                                          :text (agent-pane--pp-to-string cmds)
+                                         :raw update)
+            (agent-pane--ui-sync-transcript)))
+         ;; Config option updates.
+         ((equal kind "config_options_update")
+          (let* ((config-options (agent-pane--first-nonempty-value
+                                  (list (agent-pane--map-elt-safe update 'configOptions)
+                                        (agent-pane--map-elt-safe update 'config_options))))
+                 (payload (if config-options
+                              `((configOptions . ,config-options))
+                            update)))
+            (agent-pane--update-model-metadata payload)
+            (agent-pane--append-message* :role 'acp
+                                         :title "config_options_update"
+                                         :text (agent-pane--pp-to-string config-options)
                                          :raw update)
             (agent-pane--ui-sync-transcript)))
          ;; Fallback: show update kind + raw payload.
@@ -721,6 +1139,7 @@ Return plist keys:
                  (opts (agent-pane--listify (map-nested-elt request '(params options))))
                  (tool-call (map-nested-elt request '(params toolCall)))
                  (tool-call-id (map-elt tool-call 'toolCallId))
+                 (tool-table (map-elt agent-pane--state :tool-calls))
                  (idx-table (map-elt agent-pane--state :permission-msg-index))
                  (msg-idx (and tool-call-id (gethash tool-call-id idx-table)))
                  (decision (agent-pane--permission-decide request opts))
@@ -729,7 +1148,50 @@ Return plist keys:
                  (decision-source (or (plist-get decision :source) 'unknown))
                  (chosen-text (if (eq decision-action 'allow)
                                   (format "%s (%s)" decision-option-id decision-source)
-                                (format "cancel (%s)" decision-source))))
+                                  (format "cancel (%s)" decision-source))))
+            ;; Permission requests often carry richer tool metadata than earlier
+            ;; updates; merge it so tool labels don't fall back to opaque call ids.
+            (when (and agent-pane-show-tool-calls
+                       (hash-table-p tool-table)
+                       (stringp tool-call-id))
+              (let* ((entry (or (gethash tool-call-id tool-table)
+                                (list :toolCallId tool-call-id)))
+                     (title (map-elt tool-call 'title))
+                     (status (map-elt tool-call 'status))
+                     (tool-kind (map-elt tool-call 'kind))
+                     (command (agent-pane--tool-raw-input-command tool-call))
+                     (desc (agent-pane--tool-raw-input-description tool-call))
+                     (params (agent-pane--tool-raw-input-params tool-call))
+                     (diff (agent-pane--extract-diff-info tool-call)))
+                (setq entry (plist-put entry :toolCallId tool-call-id))
+                (when title
+                  (setq entry (plist-put entry :title title)))
+                (when status
+                  (setq entry (plist-put entry :status status)))
+                (when tool-kind
+                  (setq entry (plist-put entry :kind tool-kind)))
+                (when command
+                  (setq entry (plist-put entry :command command)))
+                (when desc
+                  (setq entry (plist-put entry :description desc)))
+                (when params
+                  (setq entry (plist-put entry :params params)))
+                (when diff
+                  (setq entry (plist-put entry :diff diff)))
+                (setq entry (plist-put entry :raw tool-call))
+                (puthash tool-call-id entry tool-table)
+                (pcase-let* ((`(,tool-idx . ,created) (agent-pane--upsert-tool-call-message tool-call-id))
+                             (old-title (map-elt (nth tool-idx (map-elt agent-pane--state :messages)) :title))
+                             (new-title (agent-pane--tool-call-display-title entry))
+                             (body (agent-pane--tool-call-entry-to-text entry)))
+                  (when created
+                    (agent-pane--ui-sync-transcript))
+                  (agent-pane--set-message-title tool-idx new-title)
+                  (agent-pane--set-message-raw tool-idx tool-call)
+                  (agent-pane--set-message-text tool-idx body)
+                  (if (or created (not (equal old-title new-title)))
+                      (agent-pane--ui-rerender-message tool-idx)
+                    (agent-pane--ui-set-message-text tool-idx body)))))
             (unless (numberp msg-idx)
               (setq msg-idx
                     (agent-pane--append-message*
@@ -792,14 +1254,16 @@ Non-fatal on error: writes an error into the current assistant message."
    ((map-elt agent-pane--state :session-id)
     (funcall on-ready))
    ((map-elt agent-pane--state :connecting)
-    (map-put! agent-pane--state :queued-prompts
-              (append (map-elt agent-pane--state :queued-prompts)
-                      (list on-ready))))
+    (let ((queued (map-elt agent-pane--state :queued-prompts)))
+      (unless (memq on-ready queued)
+        (map-put! agent-pane--state :queued-prompts
+                  (append queued (list on-ready))))))
    (t
     (map-put! agent-pane--state :connecting t)
     (agent-pane--ensure-acp-client)
     (agent-pane--subscribe)
-    (let ((client (map-elt agent-pane--state :client)))
+    (let ((client (map-elt agent-pane--state :client))
+          (request-timeout agent-pane-acp-request-timeout-seconds))
       (cl-labels
           ((finalize ()
              (map-put! agent-pane--state :connecting nil)
@@ -818,6 +1282,7 @@ Non-fatal on error: writes an error into the current assistant message."
                        ;; actually implement `fs/read_text_file' and `fs/write_text_file'.
                        :read-text-file-capability nil
                        :write-text-file-capability nil)
+             :timeout-seconds request-timeout
              :on-success
              (lambda (init-result)
                (map-put! agent-pane--state :init-result init-result)
@@ -828,9 +1293,11 @@ Non-fatal on error: writes an error into the current assistant message."
                        :client client
                        :buffer (current-buffer)
                        :request (agent-pane--make-session-new-request resume-session-id)
+                       :timeout-seconds request-timeout
                        :on-success
                        (lambda (resp)
                          (map-put! agent-pane--state :session-new-result resp)
+                         (agent-pane--update-model-metadata resp)
                          (let ((session-id (map-elt resp 'sessionId)))
                            (map-put! agent-pane--state :session-id session-id)
                            (when session-id
@@ -849,8 +1316,10 @@ Non-fatal on error: writes an error into the current assistant message."
                                          :request (acp-make-session-set-model-request
                                                    :session-id session-id
                                                    :model-id model-id)
+                                         :timeout-seconds request-timeout
                                          :on-success (lambda (r)
                                                        (map-put! agent-pane--state :session-model-result r)
+                                                       (agent-pane--update-model-metadata r)
                                                        (finalize))
                                          :on-failure (lambda (e &optional _raw)
                                                        (agent-pane--append-message
@@ -871,8 +1340,10 @@ Non-fatal on error: writes an error into the current assistant message."
                                          :request (acp-make-session-set-mode-request
                                                    :session-id session-id
                                                    :mode-id mode-id)
+                                         :timeout-seconds request-timeout
                                          :on-success (lambda (r)
                                                        (map-put! agent-pane--state :session-mode-result r)
+                                                       (agent-pane--update-model-metadata r)
                                                        (start-session-model))
                                          :on-failure (lambda (e &optional _raw)
                                                        (agent-pane--append-message
@@ -923,6 +1394,7 @@ Non-fatal on error: writes an error into the current assistant message."
                              :buffer (current-buffer)
                              :request (acp-make-authenticate-request
                                        :method-id agent-pane-auth-method-id)
+                             :timeout-seconds request-timeout
                              :on-success
                              (lambda (auth-result)
                                (map-put! agent-pane--state :auth-result auth-result)
@@ -964,6 +1436,7 @@ ON-FAILURE is called with error payload and optional raw response."
                :model-id model-id*)
      :on-success (lambda (resp)
                    (map-put! agent-pane--state :session-model-result resp)
+                   (agent-pane--update-model-metadata resp)
                    (when (functionp on-success)
                      (funcall on-success resp)))
      :on-failure (lambda (err &optional raw)
@@ -977,17 +1450,23 @@ is still streaming."
   (map-put! agent-pane--state :streaming-assistant-index nil)
   (map-put! agent-pane--state :streaming-thought-index nil)
   (map-put! agent-pane--state :last-session-update-kind nil))
-(defun agent-pane--enqueue-prompt (text)
-  "Add TEXT to the prompt queue."
+(defun agent-pane--enqueue-prompt (text &optional message-idx)
+  "Add TEXT to the prompt queue.
+When MESSAGE-IDX is numeric, it is aligned with this queued prompt and will be
+used to clear queued UI state once the prompt starts."
   (agent-pane--ensure-state)
   (map-put! agent-pane--state :prompt-queue
             (append (map-elt agent-pane--state :prompt-queue)
-                    (list text))))
+                    (list text)))
+  (map-put! agent-pane--state :prompt-queue-message-indices
+            (append (map-elt agent-pane--state :prompt-queue-message-indices)
+                    (list (and (numberp message-idx) message-idx)))))
 (defun agent-pane--pump-prompt-queue ()
   "If possible, send the next queued prompt to ACP."
   (agent-pane--ensure-state)
   (when (and agent-pane-enable-acp (not noninteractive))
     (let* ((queue (map-elt agent-pane--state :prompt-queue))
+           (queue-msg-idxs (map-elt agent-pane--state :prompt-queue-message-indices))
            (in-progress (map-elt agent-pane--state :in-progress))
            (busy (or (map-elt agent-pane--state :prompt-in-flight)
                      (memq in-progress '(streaming cancelling)))))
@@ -995,12 +1474,17 @@ is still streaming."
        ((or busy (null queue))
         nil)
        ((map-elt agent-pane--state :connecting)
-        nil)
+        (agent-pane--handshake #'agent-pane--pump-prompt-queue))
        ((not (map-elt agent-pane--state :session-id))
         (agent-pane--handshake #'agent-pane--pump-prompt-queue))
        (t
-        (let ((prompt (car queue)))
+        (let ((prompt (car queue))
+              (prompt-msg-idx (car queue-msg-idxs)))
           (map-put! agent-pane--state :prompt-queue (cdr queue))
+          (map-put! agent-pane--state :prompt-queue-message-indices (cdr queue-msg-idxs))
+          (when (numberp prompt-msg-idx)
+            (agent-pane--set-message-queued prompt-msg-idx nil)
+            (agent-pane--ui-rerender-message prompt-msg-idx))
           (agent-pane--begin-turn)
           (map-put! agent-pane--state :prompt-in-flight t)
           (map-put! agent-pane--state :in-progress 'waiting)

@@ -33,15 +33,18 @@
 (defvar agent-pane-header-details-collapsed)
 (defvar agent-pane-tool-output-preview-lines)
 (defvar agent-pane--header-details-collapsed)
+(defvar agent-pane-sessions-buffer-name)
 (defvar-local agent-pane--tool-output-full-mode nil
   "When non-nil, tool output blocks render full output in this chat buffer.")
 (declare-function agent-pane--handshake "agent-pane-acp")
 (declare-function agent-pane--set-session-model "agent-pane-acp")
+(declare-function agent-pane--available-model-ids "agent-pane-acp")
 (declare-function agent-pane--refresh-tool-call-messages "agent-pane-acp")
 (declare-function agent-pane--conversation-current-path-node-ids "agent-pane-state")
 (declare-function agent-pane--conversation-node "agent-pane-state")
 (declare-function agent-pane--conversation-node-depth "agent-pane-state")
 (declare-function agent-pane--conversation-rewind-to-node "agent-pane-state")
+(declare-function agent-pane--set-message-queued "agent-pane-state")
 (declare-function agent-pane--ui-full-render "agent-pane-ui")
 (defun agent-pane-open-acp-traffic ()
   "Open the ACP traffic buffer for the current agent-pane client."
@@ -117,11 +120,17 @@
                           :session-id session-id
                           :reason "user cancel"))
           ;; We don't get an explicit completion ack for cancel; treat this as a
-          ;; local state transition so queued follow-ups can proceed.
+          ;; local state transition and drop queued follow-ups so cancel is
+          ;; definitive from the user's perspective.
           (map-put! agent-pane--state :prompt-in-flight nil)
           (map-put! agent-pane--state :in-progress nil)
+          (map-put! agent-pane--state :prompt-queue nil)
+          (map-put! agent-pane--state :prompt-queue-message-indices nil)
+          (map-put! agent-pane--state :queued-prompts nil)
+          (map-put! agent-pane--state :streaming-assistant-index nil)
+          (map-put! agent-pane--state :streaming-thought-index nil)
           (agent-pane--rerender)
-          (agent-pane--pump-prompt-queue))
+          (message "Cancelled current run and cleared queued prompts"))
       (error
        (map-put! agent-pane--state :prompt-in-flight nil)
        (map-put! agent-pane--state :in-progress nil)
@@ -366,6 +375,10 @@ Otherwise copy the full tool message text."
     (set-keymap-parent m text-mode-map)
     (define-key m (kbd "C-c C-c") #'agent-pane-input-editor-commit)
     (define-key m (kbd "C-c C-k") #'agent-pane-input-editor-cancel)
+    (define-key m (kbd "C-c v") #'agent-pane-toggle-header-details-anywhere)
+    (define-key m (kbd "C-c C-v") #'agent-pane-toggle-header-details-anywhere)
+    (define-key m (kbd "C-c d") #'agent-pane-view-diff-at-point-anywhere)
+    (define-key m (kbd "C-c C-d") #'agent-pane-view-diff-at-point-anywhere)
     m)
   "Keymap for `agent-pane-input-editor-mode'.")
 (define-derived-mode agent-pane-input-editor-mode text-mode "agent-pane-input"
@@ -436,8 +449,15 @@ PROVIDER must be one of `codex', `copilot', `claude-code', or `custom'."
 When MODEL-ID is empty, clear the preference and use provider defaults for
 new sessions."
   (interactive
-   (list (read-string "ACP model id (empty = provider default): "
-                      (or agent-pane-session-model-id ""))))
+   (let* ((models (agent-pane--available-model-ids))
+          (current (or agent-pane-session-model-id ""))
+          (selection
+           (if models
+               (completing-read
+                "ACP model id (TAB = protocol list, empty = provider default): "
+                models nil nil nil nil current)
+             (read-string "ACP model id (empty = provider default): " current))))
+     (list selection)))
   (let* ((trimmed (string-trim (or model-id "")))
          (model-id* (unless (string-empty-p trimmed) trimmed)))
     (setq agent-pane-session-model-id model-id*)
@@ -479,6 +499,58 @@ new sessions."
   (message "ACP header details %s"
            (if agent-pane--header-details-collapsed "hidden" "shown")))
 
+(defun agent-pane--find-chat-buffer-anywhere ()
+  "Return a live `agent-pane-mode' buffer from windows or buffer list."
+  (or (let ((found nil))
+        (dolist (w (window-list nil 'no-minibuffer))
+          (let ((b (window-buffer w)))
+            (when (and (null found)
+                       (buffer-live-p b)
+                       (with-current-buffer b
+                         (derived-mode-p 'agent-pane-mode)))
+              (setq found b))))
+        found)
+      (let ((found nil))
+        (dolist (b (buffer-list))
+          (when (and (null found)
+                     (buffer-live-p b)
+                     (with-current-buffer b
+                       (derived-mode-p 'agent-pane-mode)))
+            (setq found b)))
+        found)))
+
+(defun agent-pane--live-chat-buffers ()
+  "Return all live `agent-pane-mode' buffers."
+  (let (result)
+    (dolist (buf (buffer-list))
+      (when (and (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (derived-mode-p 'agent-pane-mode)))
+        (push buf result)))
+    (nreverse result)))
+
+(defun agent-pane-toggle-header-details-anywhere ()
+  "Toggle header details in current or visible `agent-pane-mode' buffer."
+  (interactive)
+  (let ((target (if (derived-mode-p 'agent-pane-mode)
+                    (current-buffer)
+                  (agent-pane--find-chat-buffer-anywhere))))
+    (unless (buffer-live-p target)
+      (user-error "No agent-pane chat buffer is visible"))
+    (with-current-buffer target
+      (agent-pane-toggle-header-details))))
+
+(defun agent-pane-view-diff-at-point-anywhere ()
+  "View diff at point in current or visible `agent-pane-mode' buffer."
+  (interactive)
+  (let ((target (if (derived-mode-p 'agent-pane-mode)
+                    (current-buffer)
+                  (agent-pane--find-chat-buffer-anywhere))))
+    (unless (buffer-live-p target)
+      (user-error "No agent-pane chat buffer is visible"))
+    (with-current-buffer target
+      (agent-pane-view-diff-at-point))))
+
 (defun agent-pane-toggle-tool-output-mode ()
   "Toggle tool output rendering between preview and full modes."
   (interactive)
@@ -504,23 +576,26 @@ new sessions."
     (kill-buffer buffer)))
 
 (defun agent-pane-exit ()
-  "Exit agent-pane by closing chat/sidebar buffers and stopping ACP client."
+  "Exit agent-pane by closing chat/sidebar buffers and stopping ACP clients."
   (interactive)
-  (let ((chat-buf (get-buffer agent-pane-buffer-name))
+  (let ((chat-bufs (agent-pane--live-chat-buffers))
         (sessions-buf (get-buffer agent-pane-sessions-buffer-name))
         (input-buf (get-buffer agent-pane-input-editor-buffer-name))
-        client)
-    (when (buffer-live-p chat-buf)
+        clients)
+    (dolist (chat-buf chat-bufs)
       (with-current-buffer chat-buf
         (when (and (boundp 'agent-pane--state)
                    (listp agent-pane--state))
-          (setq client (map-elt agent-pane--state :client)))))
-    (when client
+          (let ((client (map-elt agent-pane--state :client)))
+            (when (and client (not (memq client clients)))
+              (push client clients))))))
+    (dolist (client clients)
       (ignore-errors
         (acp-shutdown :client client)))
     (agent-pane--close-buffer-and-windows input-buf)
     (agent-pane--close-buffer-and-windows sessions-buf)
-    (agent-pane--close-buffer-and-windows chat-buf)))
+    (dolist (chat-buf chat-bufs)
+      (agent-pane--close-buffer-and-windows chat-buf))))
 
 (defun agent-pane-submit ()
   "Submit current input.
@@ -531,26 +606,34 @@ sends it to Codex via ACP for a streamed response."
   (let ((text (agent-pane--input-text)))
     (when (or (null text) (string-empty-p text))
       (user-error "No input"))
-    ;; Model update.
-    (agent-pane--append-message 'user text)
-    ;; Transcript.
-    (agent-pane--transcript-log-session-id)
-    (agent-pane--transcript-maybe-set-title text)
-    (agent-pane--transcript-role-heading 'user)
-    (agent-pane--transcript-append (concat text "\n\n"))
-    ;; Input history + view update.
-    (agent-pane--input-history-push text)
-    (agent-pane--clear-input)
-    ;; Queue prompt for ACP.
-    (when (and agent-pane-enable-acp (not noninteractive))
-      (agent-pane--enqueue-prompt text)
-      ;; If we're idle, immediately show progress; if already streaming, keep
-      ;; the current state and just show the queued count.
-      (unless (map-elt agent-pane--state :in-progress)
-        (map-put! agent-pane--state :in-progress 'waiting)))
-    (agent-pane--rerender)
-    (when (and agent-pane-enable-acp (not noninteractive))
-      (agent-pane--pump-prompt-queue))))
+    (let* ((acp-active (and agent-pane-enable-acp (not noninteractive)))
+           (busy (and acp-active
+                      (or (map-elt agent-pane--state :connecting)
+                          (map-elt agent-pane--state :prompt-in-flight)
+                          (memq (map-elt agent-pane--state :in-progress)
+                                '(waiting streaming cancelling)))))
+           ;; Model update.
+           (idx (agent-pane--append-message 'user text)))
+      (when busy
+        (agent-pane--set-message-queued idx t))
+      ;; Transcript.
+      (agent-pane--transcript-log-session-id)
+      (agent-pane--transcript-maybe-set-title text)
+      (agent-pane--transcript-role-heading 'user)
+      (agent-pane--transcript-append (concat text "\n\n"))
+      ;; Input history + view update.
+      (agent-pane--input-history-push text)
+      (agent-pane--clear-input)
+      ;; Queue prompt for ACP.
+      (when acp-active
+        (agent-pane--enqueue-prompt text (and busy idx))
+        ;; If we're idle, immediately show progress; if already streaming, keep
+        ;; the current state and just show the queued count.
+        (unless (map-elt agent-pane--state :in-progress)
+          (map-put! agent-pane--state :in-progress 'waiting)))
+      (agent-pane--rerender)
+      (when acp-active
+        (agent-pane--pump-prompt-queue)))))
 (defvar agent-pane-mode-map
   (let ((m (make-sparse-keymap)))
     (define-key m (kbd "C-c C-c") #'agent-pane-submit)
@@ -564,14 +647,14 @@ sends it to Codex via ACP for a streamed response."
     (define-key m (kbd "C-c .") #'agent-pane-dispatch)
     (define-key m (kbd "C-c C-.") #'agent-pane-dispatch)
     (define-key m (kbd "C-c C-a") #'agent-pane-set-acp-provider)
-    (define-key m (kbd "C-c C-v") #'agent-pane-toggle-header-details)
-    (define-key m (kbd "C-c v") #'agent-pane-toggle-header-details)
+    (define-key m (kbd "C-c C-v") #'agent-pane-toggle-header-details-anywhere)
+    (define-key m (kbd "C-c v") #'agent-pane-toggle-header-details-anywhere)
     ;; `C-m' is RET in many terminals, so expose a plain-letter binding too.
     (define-key m (kbd "C-c m") #'agent-pane-set-session-model)
     (define-key m (kbd "C-c C-m") #'agent-pane-set-session-model)
     ;; Some terminals collapse control-key chords; provide plain-letter aliases.
-    (define-key m (kbd "C-c d") #'agent-pane-view-diff-at-point)
-    (define-key m (kbd "C-c C-d") #'agent-pane-view-diff-at-point)
+    (define-key m (kbd "C-c d") #'agent-pane-view-diff-at-point-anywhere)
+    (define-key m (kbd "C-c C-d") #'agent-pane-view-diff-at-point-anywhere)
     ;; Some terminals collapse C-o variants; provide both bindings.
     (define-key m (kbd "C-c o") #'agent-pane-toggle-tool-output-mode)
     (define-key m (kbd "C-c C-o") #'agent-pane-toggle-tool-output-mode)

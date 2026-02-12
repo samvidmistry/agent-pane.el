@@ -13,6 +13,17 @@
 (require 'cl-lib)
 (require 'subr-x)
 
+(defun agent-pane--md--normalize-role (role)
+  "Return ROLE normalized to a known symbol for markdown fontification."
+  (cond
+   ((memq role '(assistant thought)) role)
+   ((stringp role)
+    (pcase (downcase role)
+      ("assistant" 'assistant)
+      ("thought" 'thought)
+      (_ nil)))
+   (t nil)))
+
 (defun agent-pane--md--strong-face-for-role (role)
   "Return the face used for markdown strong for ROLE."
   (pcase role
@@ -147,134 +158,140 @@ This is intentionally lightweight and only handles a few common patterns:
 - Strong: **text**
 - Inline code: `code`
 - Fenced code blocks: ``` ... ```"
-  (when (and (integerp beg)
-             (integerp end)
-             (< beg end)
-             (memq role '(assistant thought)))
-    (save-excursion
-      (save-restriction
-        (narrow-to-region beg end)
-        (let ((inhibit-read-only t)
-              (strong-face (agent-pane--md--strong-face-for-role role)))
-          ;; Ensure our invisibility spec is present/absent.
-          (if agent-pane-markdown-hide-markup
-              (add-to-invisibility-spec 'agent-pane-markup)
-            (remove-from-invisibility-spec 'agent-pane-markup))
-          ;; Clear prior markdown properties in this region.
-          (remove-text-properties (point-min) (point-max)
-                                  '(face nil
-                                    invisible nil
-                                    display nil
-                                    mouse-face nil
-                                    help-echo nil
-                                    agent-pane-md-code-block nil
-                                    agent-pane-md-link-url nil
-                                    agent-pane-md-table nil))
-          ;; Fenced code blocks.
-          (goto-char (point-min))
-          (while (re-search-forward "^```.*$" nil t)
-            (let* ((fence1-beg (match-beginning 0))
-                   (fence1-end (match-end 0))
-                   (block-beg (min (point-max) (1+ fence1-end))))
-              (add-text-properties
-               fence1-beg fence1-end
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))
-              (when (re-search-forward "^```.*$" nil t)
-                (let* ((fence2-beg (match-beginning 0))
-                       (fence2-end (match-end 0))
-                       (block-end (max block-beg (1- fence2-beg))))
-                  (when (< block-beg block-end)
-                    (add-text-properties block-beg block-end
-                                         '(face agent-pane-markdown-code
-                                           agent-pane-md-code-block t)))
-                  (add-text-properties
-                   fence2-beg fence2-end
-                   `(face agent-pane-markdown-delimiter
-                     ,@(when agent-pane-markdown-hide-markup
-                         '(invisible agent-pane-markup))))))))
-          ;; Inline code.
-          (goto-char (point-min))
-          (while (re-search-forward "`\\([^`\n]+\\)`" nil t)
-            (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
-              (add-text-properties
-               (match-beginning 0) (1+ (match-beginning 0))
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))
-              (add-text-properties (match-beginning 1) (match-end 1)
-                                   '(face agent-pane-markdown-code))
-              (add-text-properties
-               (1- (match-end 0)) (match-end 0)
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))))
-          ;; Headings.
-          (goto-char (point-min))
-          (while (re-search-forward "^\\(#+\\)\\([ \t]+\\)\\(.+\\)$" nil t)
-            (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
-              (add-text-properties
-               (match-beginning 1) (match-end 1)
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))
-              (add-text-properties (match-beginning 3) (match-end 3)
-                                   '(face agent-pane-markdown-heading))))
-          ;; Unordered list markers.
-          (goto-char (point-min))
-          (while (re-search-forward "^\\([ \t]*\\)\\([-*+]\\)\\([ \t]+\\)" nil t)
-            (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
-              (add-text-properties (match-beginning 2) (match-end 2)
-                                   '(face agent-pane-markdown-list-marker))))
-          ;; Links: [label](url)
-          (goto-char (point-min))
-          (while (re-search-forward "\\[\\([^]\\n]+\\)\\](\\([^)\\n]+\\))" nil t)
-            (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
-              (add-text-properties
-               (match-beginning 0) (1+ (match-beginning 0))
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))
-              (add-text-properties (match-beginning 1) (match-end 1)
-                                   '(face agent-pane-markdown-link-label
-                                     mouse-face highlight
-                                     help-echo "Markdown link"))
-              (add-text-properties
-               (match-end 1) (1+ (match-end 1))
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))
-              (add-text-properties
-               (1+ (match-end 1)) (+ (match-end 1) 2)
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))
-              (add-text-properties (match-beginning 2) (match-end 2)
-                                   '(face agent-pane-markdown-code
-                                     agent-pane-md-link-url t))
-              (add-text-properties
-               (1- (match-end 0)) (match-end 0)
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))))
-          ;; Strong emphasis.
-          (goto-char (point-min))
-          (while (re-search-forward "\\*\\*\\([^*\n][^*\n]*?\\)\\*\\*" nil t)
-            (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
-              (add-text-properties
-               (match-beginning 0) (+ (match-beginning 0) 2)
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))
-              (add-text-properties (match-beginning 1) (match-end 1)
-                                   `(face ,strong-face))
-              (add-text-properties
-               (- (match-end 0) 2) (match-end 0)
-               `(face agent-pane-markdown-delimiter
-                 ,@(when agent-pane-markdown-hide-markup
-                     '(invisible agent-pane-markup))))))
-          ;; Tables.
-          (agent-pane--md--fontify-tables))))))
+  (let ((normalized-role (agent-pane--md--normalize-role role)))
+    (when (and (integerp beg)
+               (integerp end)
+               (< beg end)
+               normalized-role)
+      (save-excursion
+        (save-restriction
+          (narrow-to-region beg end)
+          (let ((inhibit-read-only t)
+                (strong-face (agent-pane--md--strong-face-for-role normalized-role)))
+            ;; Ensure our invisibility spec is present/absent.
+            (if agent-pane-markdown-hide-markup
+                (add-to-invisibility-spec 'agent-pane-markup)
+              (remove-from-invisibility-spec 'agent-pane-markup))
+            ;; Clear prior markdown properties in this region.
+            (remove-text-properties (point-min) (point-max)
+                                    '(face nil
+                                      invisible nil
+                                      display nil
+                                      mouse-face nil
+                                      help-echo nil
+                                      agent-pane-md-code-block nil
+                                      agent-pane-md-link-url nil
+                                      agent-pane-md-table nil))
+            ;; Thought text should keep a distinct base styling even outside
+            ;; markdown constructs.
+            (when (eq normalized-role 'thought)
+              (add-text-properties (point-min) (point-max)
+                                   '(face agent-pane-role-thought)))
+            ;; Fenced code blocks.
+            (goto-char (point-min))
+            (while (re-search-forward "^```.*$" nil t)
+              (let* ((fence1-beg (match-beginning 0))
+                     (fence1-end (match-end 0))
+                     (block-beg (min (point-max) (1+ fence1-end))))
+                (add-text-properties
+                 fence1-beg fence1-end
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))
+                (when (re-search-forward "^```.*$" nil t)
+                  (let* ((fence2-beg (match-beginning 0))
+                         (fence2-end (match-end 0))
+                         (block-end (max block-beg (1- fence2-beg))))
+                    (when (< block-beg block-end)
+                      (add-text-properties block-beg block-end
+                                           '(face agent-pane-markdown-code
+                                             agent-pane-md-code-block t)))
+                    (add-text-properties
+                     fence2-beg fence2-end
+                     `(face agent-pane-markdown-delimiter
+                       ,@(when agent-pane-markdown-hide-markup
+                           '(invisible agent-pane-markup))))))))
+            ;; Inline code.
+            (goto-char (point-min))
+            (while (re-search-forward "`\\([^`\n]+\\)`" nil t)
+              (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
+                (add-text-properties
+                 (match-beginning 0) (1+ (match-beginning 0))
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))
+                (add-text-properties (match-beginning 1) (match-end 1)
+                                     '(face agent-pane-markdown-code))
+                (add-text-properties
+                 (1- (match-end 0)) (match-end 0)
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))))
+            ;; Headings.
+            (goto-char (point-min))
+            (while (re-search-forward "^\\(#+\\)\\([ \t]+\\)\\(.+\\)$" nil t)
+              (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
+                (add-text-properties
+                 (match-beginning 1) (match-end 1)
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))
+                (add-text-properties (match-beginning 3) (match-end 3)
+                                     '(face agent-pane-markdown-heading))))
+            ;; Unordered list markers.
+            (goto-char (point-min))
+            (while (re-search-forward "^\\([ \t]*\\)\\([-*+]\\)\\([ \t]+\\)" nil t)
+              (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
+                (add-text-properties (match-beginning 2) (match-end 2)
+                                     '(face agent-pane-markdown-list-marker))))
+            ;; Links: [label](url)
+            (goto-char (point-min))
+            (while (re-search-forward "\\[\\([^]\\n]+\\)\\](\\([^)\\n]+\\))" nil t)
+              (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
+                (add-text-properties
+                 (match-beginning 0) (1+ (match-beginning 0))
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))
+                (add-text-properties (match-beginning 1) (match-end 1)
+                                     '(face agent-pane-markdown-link-label
+                                       mouse-face highlight
+                                       help-echo "Markdown link"))
+                (add-text-properties
+                 (match-end 1) (1+ (match-end 1))
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))
+                (add-text-properties
+                 (1+ (match-end 1)) (+ (match-end 1) 2)
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))
+                (add-text-properties (match-beginning 2) (match-end 2)
+                                     '(face agent-pane-markdown-code
+                                       agent-pane-md-link-url t))
+                (add-text-properties
+                 (1- (match-end 0)) (match-end 0)
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))))
+            ;; Strong emphasis.
+            (goto-char (point-min))
+            (while (re-search-forward "\\*\\*\\([^*\n][^*\n]*?\\)\\*\\*" nil t)
+              (unless (get-text-property (match-beginning 0) 'agent-pane-md-code-block)
+                (add-text-properties
+                 (match-beginning 0) (+ (match-beginning 0) 2)
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))
+                (add-text-properties (match-beginning 1) (match-end 1)
+                                     `(face ,strong-face))
+                (add-text-properties
+                 (- (match-end 0) 2) (match-end 0)
+                 `(face agent-pane-markdown-delimiter
+                   ,@(when agent-pane-markdown-hide-markup
+                       '(invisible agent-pane-markup))))))
+            ;; Tables.
+            (agent-pane--md--fontify-tables)))))))
 (provide 'agent-pane-markdown)
 ;;; agent-pane-markdown.el ends here

@@ -47,16 +47,22 @@
   "Face used for low-level ACP protocol events."
   :group 'agent-pane)
 (defface agent-pane-tool-invocation-block
-  '((((class color) (background dark)) :foreground "#f9a8d4" :background "#3b1d2e")
-    (((class color) (background light)) :foreground "#9d174d" :background "#ffe4f1")
-    (t :inherit default))
-  "Face for concise tool invocation lines."
+  '((((class color) (background dark))
+     :foreground "#bbf7d0" :background "#163425" :extend t)
+    (((class color) (background light))
+     :foreground "#14532d" :background "#dcfce7" :extend t)
+    (t :inherit default :extend t))
+  "Face for concise tool invocation lines.
+Uses a subtle green block background and extends to window edge."
   :group 'agent-pane)
 (defface agent-pane-tool-output-block
-  '((((class color) (background dark)) :foreground "#e2e8f0" :background "#1f2937")
-    (((class color) (background light)) :foreground "#0f172a" :background "#e2e8f0")
-    (t :inherit default))
-  "Face for collapsed tool output preview blocks."
+  '((((class color) (background dark))
+     :foreground "#d1fae5" :background "#1c3a2b" :extend t)
+    (((class color) (background light))
+     :foreground "#064e3b" :background "#d1fae5" :extend t)
+    (t :inherit default :extend t))
+  "Face for tool output blocks.
+Uses a subtle green block background and extends to window edge."
   :group 'agent-pane)
 (defface agent-pane-header-title
   '((((class color) (background dark)) :foreground "#e2e8f0" :weight bold)
@@ -123,6 +129,12 @@
     (((class color) (background light)) :foreground "#0f172a")
     (t :inherit default))
   "Face for session entries in the sessions sidebar."
+  :group 'agent-pane)
+(defface agent-pane-sessions-active-session
+  '((((class color) (background dark)) :background "#1e293b" :weight semibold :extend t)
+    (((class color) (background light)) :background "#dbeafe" :weight semibold :extend t)
+    (t :inherit highlight))
+  "Face for the active session line in the sessions sidebar."
   :group 'agent-pane)
 (defface agent-pane-markdown-strong-assistant
   '((t :inherit font-lock-keyword-face :weight normal))
@@ -233,6 +245,11 @@ When non-nil, agent-pane sends `session/set_model'.
 When nil, the provider default model is used."
   :type '(choice (const :tag "Provider default" nil) string)
   :group 'agent-pane)
+(defcustom agent-pane-acp-request-timeout-seconds 30
+  "Timeout (seconds) for ACP requests that gate handshake progress.
+When nil or non-positive, handshake requests wait indefinitely."
+  :type '(choice (const :tag "No timeout" nil) number)
+  :group 'agent-pane)
 (defcustom agent-pane-permission-policy 'auto-allow
   "How to respond to `session/request_permission' requests.
 `auto-allow' chooses an allow option automatically.
@@ -290,7 +307,8 @@ This sets `acp-logging-enabled' when agent-pane establishes a connection."
   :group 'agent-pane)
 (defcustom agent-pane-diff-viewer 'diff-mode
   "Viewer used when opening file-change diffs from agent-pane.
-`diff-mode' opens a unified diff buffer.
+`diff-mode' opens a unified diff buffer without requiring an external
+`diff' binary.
 `ediff' opens an Ediff session between before/after buffers."
   :type '(choice (const :tag "Unified diff buffer" diff-mode)
                  (const :tag "Ediff session" ediff))

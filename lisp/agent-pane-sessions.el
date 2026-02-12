@@ -19,6 +19,8 @@
 ;; Avoid compile-time warnings; these are defined in agent-pane.el.
 (declare-function agent-pane-mode "agent-pane")
 (declare-function agent-pane-exit "agent-pane")
+(declare-function agent-pane-toggle-header-details-anywhere "agent-pane")
+(declare-function agent-pane-view-diff-at-point-anywhere "agent-pane")
 (declare-function agent-pane--goto-input "agent-pane")
 (declare-function agent-pane--make-state "agent-pane-state")
 (declare-function agent-pane--rerender "agent-pane-ui")
@@ -60,6 +62,28 @@
   :type 'integer
   :group 'agent-pane-sessions)
 
+(defcustom agent-pane-sessions-status-style 'icons
+  "How live session status is shown in the sidebar."
+  :type '(choice (const :tag "Icons" icons)
+                 (const :tag "Text prefixes" text))
+  :group 'agent-pane-sessions)
+
+(defcustom agent-pane-sessions-status-animate-running nil
+  "When non-nil, animate the running status indicator in the sidebar."
+  :type 'boolean
+  :group 'agent-pane-sessions)
+
+(defcustom agent-pane-sessions-status-animation-interval 0.4
+  "Seconds between running-status animation frames in sidebar."
+  :type 'number
+  :group 'agent-pane-sessions)
+
+(defcustom agent-pane-sessions-running-icon-frames ["•"]
+  "Glyphs used for running status indicator.
+When animation is enabled, the icon cycles across frames."
+  :type '(vector string)
+  :group 'agent-pane-sessions)
+
 (defvar agent-pane-transcript-directory)
 
 (defvar-local agent-pane-sessions--index nil
@@ -72,6 +96,12 @@ This is a list of (PROJECT-ROOT . SESSIONS).  SESSIONS is a list of plists.")
 
 (defvar-local agent-pane-sessions--sort-mode nil
   "Current sort mode symbol for the sidebar.")
+
+(defvar-local agent-pane-sessions--running-frame-index 0
+  "Current running-status animation frame index.")
+
+(defvar agent-pane-sessions--status-animation-timer nil
+  "Timer driving running-status animation in the sessions sidebar.")
 
 (defun agent-pane-sessions--transcript-files ()
   "Return a list of transcript files in `agent-pane-transcript-directory'."
@@ -308,28 +338,82 @@ Return value is a list of (PROJECT-ROOT . SESSIONS) pairs."
           (push (cons root sorted) result))))
     (nreverse result)))
 
+(defun agent-pane-sessions--normalize-file (file)
+  "Return canonical absolute path for FILE, or nil."
+  (when (and (stringp file)
+             (not (string-empty-p file)))
+    (ignore-errors
+      (file-truename (expand-file-name file)))))
+
+(defun agent-pane-sessions--chat-buffer-transcript-file (buffer)
+  "Return transcript file associated with chat BUFFER, or nil."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'agent-pane-mode)
+        (let* ((state (and (boundp 'agent-pane--state) agent-pane--state))
+               (file (and (listp state) (map-elt state :transcript-file))))
+          (agent-pane-sessions--normalize-file file))))))
+
+(defun agent-pane-sessions--active-transcript-file ()
+  "Return transcript file for the active chat tied to this sidebar."
+  (when-let ((sessions-win (get-buffer-window (current-buffer) t)))
+    (let* ((sessions-frame (window-frame sessions-win))
+           (selected-win (selected-window))
+           (selected-chat-win
+            (and (window-live-p selected-win)
+                 (eq (window-frame selected-win) sessions-frame)
+                 (with-current-buffer (window-buffer selected-win)
+                   (derived-mode-p 'agent-pane-mode))
+                 selected-win))
+           (chat-win (or selected-chat-win
+                         (agent-pane-sessions--chat-target-window))))
+      (when (window-live-p chat-win)
+        (agent-pane-sessions--chat-buffer-transcript-file
+         (window-buffer chat-win))))))
+
 (defun agent-pane-sessions--chat-buffer-for-transcript (file)
   "Return live chat buffer associated with transcript FILE, or nil."
-  (let ((target (file-truename (expand-file-name file))))
+  (let ((target (agent-pane-sessions--normalize-file file)))
     (cl-loop for buf in (buffer-list)
              when (buffer-live-p buf)
              thereis
              (with-current-buffer buf
                (when (derived-mode-p 'agent-pane-mode)
-                 (let ((state (and (boundp 'agent-pane--state) agent-pane--state))
-                       (tf nil))
-                   (setq tf (and (listp state) (map-elt state :transcript-file)))
-                   (when (and tf (file-exists-p tf)
-                              (equal (file-truename (expand-file-name tf)) target))
+                 (let ((tf (agent-pane-sessions--chat-buffer-transcript-file buf)))
+                   (when (and tf target
+                              (equal tf target))
                      buf)))))))
 
-(defun agent-pane-sessions--state-has-agent-output-p (state)
-  "Return non-nil when STATE has at least one non-user message."
-  (let ((msgs (and (listp state) (map-elt state :messages))))
+(defun agent-pane-sessions--close-buffer-and-windows (buffer)
+  "Close windows showing BUFFER, then kill BUFFER."
+  (when (buffer-live-p buffer)
+    (dolist (win (get-buffer-window-list buffer nil t))
+      (when (window-live-p win)
+        (if (one-window-p t win)
+            (with-selected-window win
+              (switch-to-buffer (other-buffer buffer t)))
+          (delete-window win))))
+    (kill-buffer buffer)))
+
+(defun agent-pane-sessions--close-chat-buffers-for-transcript (file)
+  "Close all live chat buffers associated with transcript FILE."
+  (when file
+    (let ((buf (agent-pane-sessions--chat-buffer-for-transcript file)))
+      (while (buffer-live-p buf)
+        (agent-pane-sessions--close-buffer-and-windows buf)
+        (setq buf (agent-pane-sessions--chat-buffer-for-transcript file))))))
+
+(defun agent-pane-sessions--state-has-unseen-agent-output-p (state)
+  "Return non-nil when STATE has unseen non-user output for the user."
+  (let* ((msgs (and (listp state) (map-elt state :messages)))
+         (seen (if (listp state)
+                   (or (map-elt state :session-seen-message-count) 0)
+                 0))
+         (start (max 0 (min seen (length msgs)))))
     (cl-some (lambda (m)
                (memq (map-elt m :role)
                      '(assistant thought tool system acp)))
-             msgs)))
+             (nthcdr start msgs))))
 
 (defun agent-pane-sessions--session-status (session)
   "Return live status symbol for SESSION.
@@ -353,16 +437,99 @@ Possible values:
                                     (consp (map-elt state :prompt-queue))))))
              (cond
               (running 'running)
-              ((agent-pane-sessions--state-has-agent-output-p state) 'done)
+              ((agent-pane-sessions--state-has-unseen-agent-output-p state) 'done)
               (t 'waiting-input)))))))
 
-(defun agent-pane-sessions--session-status-prefix (session)
-  "Return display prefix describing SESSION live status."
-  (pcase (agent-pane-sessions--session-status session)
-    ('running "[RUN] ")
-    ('done "[DONE] ")
-    ('waiting-input "[WAIT] ")
-    (_ "       ")))
+(defun agent-pane-sessions--fixed-width-status-icon (icon)
+  "Return ICON normalized to exactly one display column."
+  (let ((s (or icon " ")))
+    (cond
+     ((= (string-width s) 1) s)
+     ((< (string-width s) 1) " ")
+     (t (truncate-string-to-width s 1 nil nil "")))))
+
+(defun agent-pane-sessions--running-icon ()
+  "Return current running-status icon frame."
+  (let* ((frames (if (vectorp agent-pane-sessions-running-icon-frames)
+                     agent-pane-sessions-running-icon-frames
+                   ["•"]))
+         (len (max 1 (length frames)))
+         (idx (mod agent-pane-sessions--running-frame-index len)))
+    (agent-pane-sessions--fixed-width-status-icon
+     (or (aref frames idx) "•"))))
+
+(defun agent-pane-sessions--session-status-indicator (session)
+  "Return display indicator describing SESSION live status."
+  (let ((status (agent-pane-sessions--session-status session)))
+    (pcase agent-pane-sessions-status-style
+      ('text
+       (pcase status
+         ('running "[RUN] ")
+         ('done "[DONE] ")
+         ('waiting-input "[WAIT] ")
+         (_ "       ")))
+      (_
+       (pcase status
+         ('running (format "%s " (agent-pane-sessions--running-icon)))
+         ('done "✓ ")
+         ('waiting-input "… ")
+         (_ "  "))))))
+
+(defun agent-pane-sessions--status-legend ()
+  "Return human-readable legend for live status indicators."
+  (pcase agent-pane-sessions-status-style
+    ('text "[RUN]/[DONE]/[WAIT] live status")
+    (_ "icons: running(•), done(✓), waiting(…)")))
+
+(defun agent-pane-sessions--running-visible-p ()
+  "Return non-nil when any currently visible session is running."
+  (cl-some (lambda (group)
+             (cl-some (lambda (s)
+                        (eq (agent-pane-sessions--session-status s) 'running))
+                      (cdr group)))
+           (agent-pane-sessions--visible-groups)))
+
+(defun agent-pane-sessions--stop-status-animation ()
+  "Stop sidebar status animation timer, if any."
+  (when (timerp agent-pane-sessions--status-animation-timer)
+    (cancel-timer agent-pane-sessions--status-animation-timer)
+    (setq agent-pane-sessions--status-animation-timer nil)))
+
+(defun agent-pane-sessions--status-animation-tick ()
+  "Advance running-status animation and re-render sidebar when needed."
+  (if-let ((buf (get-buffer agent-pane-sessions-buffer-name)))
+      (if (not (buffer-live-p buf))
+          (agent-pane-sessions--stop-status-animation)
+        (with-current-buffer buf
+          (if (not (derived-mode-p 'agent-pane-sessions-mode))
+              (agent-pane-sessions--stop-status-animation)
+            (if (and (eq agent-pane-sessions-status-style 'icons)
+                     agent-pane-sessions-status-animate-running
+                     (agent-pane-sessions--running-visible-p))
+                (let* ((frames (if (vectorp agent-pane-sessions-running-icon-frames)
+                                   agent-pane-sessions-running-icon-frames
+                                 ["•"]))
+                       (len (max 1 (length frames))))
+                  (setq-local agent-pane-sessions--running-frame-index
+                              (mod (1+ agent-pane-sessions--running-frame-index) len))
+                  (let ((inhibit-read-only t))
+                    (agent-pane-sessions--render)
+                    (setq buffer-read-only t)))
+              (agent-pane-sessions--stop-status-animation)))))
+    (agent-pane-sessions--stop-status-animation)))
+
+(defun agent-pane-sessions--ensure-status-animation ()
+  "Start or stop sidebar status animation based on current conditions."
+  (if (and (derived-mode-p 'agent-pane-sessions-mode)
+           (eq agent-pane-sessions-status-style 'icons)
+           agent-pane-sessions-status-animate-running
+           (agent-pane-sessions--running-visible-p))
+      (unless (timerp agent-pane-sessions--status-animation-timer)
+        (setq agent-pane-sessions--status-animation-timer
+              (run-with-timer agent-pane-sessions-status-animation-interval
+                              agent-pane-sessions-status-animation-interval
+                              #'agent-pane-sessions--status-animation-tick)))
+    (agent-pane-sessions--stop-status-animation)))
 
 (defun agent-pane-sessions--format-session-line (session)
   "Format a SESSION plist for display line text."
@@ -380,7 +547,7 @@ Possible values:
                                              agent-pane-sessions-preview-max-width
                                              nil nil "…")))
     (concat
-     (agent-pane-sessions--session-status-prefix session)
+     (agent-pane-sessions--session-status-indicator session)
      (if (string-empty-p created-s)
          title*
        (format "%s (%s)" title* created-s))
@@ -396,9 +563,28 @@ Possible values:
     ('title "title")
     (_ "recency")))
 
+(defun agent-pane-sessions--goto-prop-value (prop value)
+  "Move point to first position where text property PROP equals VALUE.
+Return non-nil when a match is found."
+  (let ((pos (point-min))
+        found)
+    (while (and (not found) (< pos (point-max)))
+      (when (equal (get-text-property pos prop) value)
+        (setq found pos))
+      (setq pos (or (next-single-property-change pos prop nil (point-max))
+                    (point-max))))
+    (when found
+      (goto-char found)
+      t)))
+
 (defun agent-pane-sessions--render ()
   "Render the sessions sidebar in the current buffer."
   (let* ((inhibit-read-only t)
+         (saved-session-file (get-text-property (point) 'agent-pane-session-file))
+         (saved-project-root (get-text-property (point) 'agent-pane-project-root))
+         (saved-line (line-number-at-pos))
+         (saved-col (current-column))
+         (active-session-file (agent-pane-sessions--active-transcript-file))
          (visible-groups (agent-pane-sessions--visible-groups))
          (all-count (cl-loop for (_ . xs) in agent-pane-sessions--index sum (length xs)))
          (visible-count (cl-loop for (_ . xs) in visible-groups sum (length xs)))
@@ -411,7 +597,8 @@ Possible values:
                                 visible-count
                                 all-count)
                         'face 'agent-pane-sessions-meta))
-    (insert (propertize "Keys: RET open/replay | o open .md | n new | / filter | c clear | s sort | r rename | C-k delete | TAB fold | g refresh | q exit | [RUN]/[DONE]/[WAIT] live status\n\n"
+    (insert (propertize (format "Keys: RET open/replay | o open .md | n new chat | a add project | / filter | c clear | s sort | r rename | C-k delete | TAB fold | g refresh | q exit | %s\n\n"
+                                (agent-pane-sessions--status-legend))
                         'face 'agent-pane-sessions-meta))
     (if (null visible-groups)
         (insert (propertize "No sessions match current filter.\n" 'face 'agent-pane-sessions-meta))
@@ -428,28 +615,45 @@ Possible values:
            (list 'agent-pane-project-root root
                  'help-echo root))
           (dolist (s sessions)
-            (let ((ss (point)))
+            (let* ((ss (point))
+                   (file (plist-get s :file))
+                   (active-p (and active-session-file
+                                  (equal (agent-pane-sessions--normalize-file file)
+                                         active-session-file)))
+                   (face (if active-p
+                             '(agent-pane-sessions-session
+                               agent-pane-sessions-active-session)
+                           'agent-pane-sessions-session)))
               (insert (propertize
                        (format "** %s\n" (agent-pane-sessions--format-session-line s))
-                       'face 'agent-pane-sessions-session))
+                       'face face))
               (add-text-properties
                ss (point)
-               (list 'agent-pane-session-file (plist-get s :file)
+               (list 'agent-pane-session-file file
+                     'agent-pane-session-active active-p
                      'agent-pane-project-root root
                      'help-echo (string-join
                                  (delq nil
-                                       (list (plist-get s :file)
+                                       (list file
                                              (when-let ((sid (plist-get s :session-id)))
                                                (format "sessionId: %s" sid))
                                              (when-let ((created (plist-get s :created)))
                                                (format "created: %s"
                                                        (format-time-string "%F %T" created)))))
                                  "\n"))))))))
-    (goto-char (point-min))
-    (forward-line 4)
     (when (and agent-pane-sessions-project-collapsed-by-default
                (string-empty-p query))
-      (outline-hide-sublevels 1))))
+      (outline-hide-sublevels 1))
+    (unless (or (and saved-session-file
+                     (agent-pane-sessions--goto-prop-value
+                      'agent-pane-session-file saved-session-file))
+                (and saved-project-root
+                     (agent-pane-sessions--goto-prop-value
+                      'agent-pane-project-root saved-project-root)))
+      (goto-char (point-min))
+      (forward-line (max 0 (1- saved-line))))
+    (move-to-column saved-col)
+    (agent-pane-sessions--ensure-status-animation)))
 
 (defun agent-pane-sessions-refresh ()
   "Refresh the sidebar index and re-render."
@@ -531,6 +735,9 @@ sidebar window is visible."
          (root0 (or (plist-get meta :project-root) ""))
          (root (if (string-empty-p root0) default-directory root0))
          (existing (agent-pane-sessions--chat-buffer-for-transcript file))
+         (existing-point (and (buffer-live-p existing)
+                              (with-current-buffer existing
+                                (point))))
          (buf (or existing
                   (get-buffer-create
                    (agent-pane-sessions--chat-buffer-name-for-transcript file)))))
@@ -555,9 +762,17 @@ sidebar window is visible."
           (map-put! agent-pane--state :resume-session-id (plist-get meta :session-id))
           (map-put! agent-pane--state :transcript-session-id-logged
                     (and (plist-get meta :session-id) t))
-          (agent-pane--rerender)))
-      (when (fboundp 'agent-pane--goto-input)
-        (agent-pane--goto-input)))))
+          (agent-pane--rerender))
+        (map-put! agent-pane--state :session-seen-message-count
+                  (length (or (map-elt agent-pane--state :messages) nil)))
+        (cond
+         (same-file
+          (when (integerp existing-point)
+            (goto-char (min (point-max) (max (point-min) existing-point)))))
+         ((fboundp 'agent-pane--goto-input)
+          (agent-pane--goto-input))
+         (t
+          (goto-char (point-max))))))))
 
 (defun agent-pane-sessions-open-at-point ()
   "Open the transcript session at point in the chat view."
@@ -565,7 +780,8 @@ sidebar window is visible."
   (let ((file (get-text-property (point) 'agent-pane-session-file)))
     (unless (and file (file-exists-p file))
       (user-error "No session at point"))
-    (agent-pane-sessions--open-transcript-in-chat file)))
+    (agent-pane-sessions--open-transcript-in-chat file)
+    (agent-pane-sessions-rerender-if-visible)))
 
 (defun agent-pane-sessions-open-file-at-point ()
   "Open the transcript Markdown file at point in view mode."
@@ -614,6 +830,23 @@ sidebar window is visible."
       (agent-pane-sessions-refresh)
       (message "Renamed session: %s" next))))
 
+(defun agent-pane-sessions--neighbor-session-file ()
+  "Return the file path of the nearest neighboring session line.
+
+Prefers the next session line; falls back to the previous one."
+  (or (save-excursion
+        (forward-line 1)
+        (while (and (not (eobp))
+                    (not (get-text-property (point) 'agent-pane-session-file)))
+          (forward-line 1))
+        (get-text-property (point) 'agent-pane-session-file))
+      (save-excursion
+        (forward-line -1)
+        (while (and (not (bobp))
+                    (not (get-text-property (point) 'agent-pane-session-file)))
+          (forward-line -1))
+        (get-text-property (point) 'agent-pane-session-file))))
+
 (defun agent-pane-sessions-delete-at-point ()
   "Delete transcript session at point after confirmation."
   (interactive)
@@ -622,9 +855,14 @@ sidebar window is visible."
       (user-error "No session at point"))
     (when (y-or-n-p (format "Delete session transcript %s? "
                             (file-name-nondirectory file)))
-      (delete-file file)
-      (agent-pane-sessions-refresh)
-      (message "Deleted session: %s" (file-name-nondirectory file)))))
+      (let ((neighbor (agent-pane-sessions--neighbor-session-file)))
+        (agent-pane-sessions--close-chat-buffers-for-transcript file)
+        (delete-file file)
+        (agent-pane-sessions-refresh)
+        (when neighbor
+          (agent-pane-sessions--goto-prop-value
+           'agent-pane-session-file neighbor))
+        (message "Deleted session: %s" (file-name-nondirectory file))))))
 
 (defun agent-pane-sessions-set-filter (query)
   "Set sidebar filter QUERY and re-render.
@@ -656,15 +894,30 @@ When QUERY is empty, clear the filter."
   (setq buffer-read-only t)
   (message "Sort mode: %s" (agent-pane-sessions--sort-mode-label)))
 
-(defun agent-pane-sessions-new-chat ()
-  "Start a new agent-pane chat for the project at point.
+(defun agent-pane-sessions--normalize-project-root (root)
+  "Return normalized absolute project ROOT without trailing slash."
+  (directory-file-name (expand-file-name root)))
+
+(defun agent-pane-sessions--read-project-root (&optional initial-root)
+  "Prompt for a project root and return normalized absolute path.
+INITIAL-ROOT seeds the prompt when non-nil."
+  (let* ((seed0 (or initial-root default-directory))
+         (seed (file-name-as-directory
+                (expand-file-name
+                 (if (string-empty-p (or seed0 ""))
+                     default-directory
+                   seed0))))
+         (dir (read-directory-name "Project root: " seed seed t)))
+    (agent-pane-sessions--normalize-project-root dir)))
+
+(defun agent-pane-sessions--start-new-chat (root)
+  "Start a new agent-pane chat rooted at ROOT.
 Always creates a fresh chat buffer, leaving existing runs untouched."
-  (interactive)
-  (let ((root (get-text-property (point) 'agent-pane-project-root)))
-    (unless root
-      (user-error "No project at point"))
+  (let* ((root* (agent-pane-sessions--normalize-project-root root)))
+    (unless (file-directory-p root*)
+      (user-error "Project root does not exist: %s" root*))
     (require 'agent-pane)
-    (let* ((proj (file-name-nondirectory (directory-file-name (expand-file-name root))))
+    (let* ((proj (file-name-nondirectory root*))
            (base (format "%s<%s-new>"
                          (if (boundp 'agent-pane-buffer-name)
                              agent-pane-buffer-name
@@ -673,10 +926,29 @@ Always creates a fresh chat buffer, leaving existing runs untouched."
            (buf (generate-new-buffer base)))
       (agent-pane-sessions--display-chat-buffer buf)
       (with-current-buffer buf
-        (setq default-directory (file-name-as-directory (expand-file-name root)))
+        (setq default-directory (file-name-as-directory root*))
         (agent-pane-mode)
         (when (fboundp 'agent-pane--goto-input)
           (agent-pane--goto-input))))))
+
+(defun agent-pane-sessions-new-chat ()
+  "Start a new agent-pane chat for project at point.
+When point is not on a known project, prompt for a project root."
+  (interactive)
+  (let ((root (or (get-text-property (point) 'agent-pane-project-root)
+                  (agent-pane-sessions--read-project-root))))
+    (agent-pane-sessions--start-new-chat root)))
+
+(defun agent-pane-sessions-add-project (root)
+  "Start a new chat for ROOT selected via directory prompt."
+  (interactive
+   (list (agent-pane-sessions--read-project-root
+          (get-text-property (point) 'agent-pane-project-root))))
+  (agent-pane-sessions--start-new-chat root))
+
+(defun agent-pane-sessions--on-buffer-killed ()
+  "Handle sessions buffer teardown."
+  (agent-pane-sessions--stop-status-animation))
 
 (defvar agent-pane-sessions-mode-map
   (let ((m (make-sparse-keymap)))
@@ -691,6 +963,11 @@ Always creates a fresh chat buffer, leaving existing runs untouched."
     (define-key m (kbd "s") #'agent-pane-sessions-toggle-sort)
     (define-key m (kbd "TAB") #'outline-toggle-children)
     (define-key m (kbd "n") #'agent-pane-sessions-new-chat)
+    (define-key m (kbd "a") #'agent-pane-sessions-add-project)
+    (define-key m (kbd "C-c v") #'agent-pane-toggle-header-details-anywhere)
+    (define-key m (kbd "C-c C-v") #'agent-pane-toggle-header-details-anywhere)
+    (define-key m (kbd "C-c d") #'agent-pane-view-diff-at-point-anywhere)
+    (define-key m (kbd "C-c C-d") #'agent-pane-view-diff-at-point-anywhere)
     (define-key m (kbd "q") #'agent-pane-exit)
     (define-key m (kbd "C-c C-q") #'agent-pane-exit)
     m)
@@ -710,6 +987,7 @@ Always creates a fresh chat buffer, leaving existing runs untouched."
                   agent-pane-sessions-default-sort-mode))
   (outline-minor-mode 1)
   (use-local-map agent-pane-sessions-mode-map)
+  (add-hook 'kill-buffer-hook #'agent-pane-sessions--on-buffer-killed nil t)
   (agent-pane-sessions-refresh))
 
 ;;;###autoload

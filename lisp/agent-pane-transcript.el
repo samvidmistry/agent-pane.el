@@ -35,45 +35,57 @@
          (ts (format-time-string "%Y%m%d-%H%M%S"))
          (file (format "%s--%s--%s.md" ts (agent-pane--slugify proj-name) hash)))
     (expand-file-name file agent-pane-transcript-directory)))
+
+(defun agent-pane--transcript-has-interaction-p ()
+  "Return non-nil when this chat has at least one user interaction."
+  (or (map-elt agent-pane--state :transcript-file)
+      (let ((found nil))
+        (dolist (msg (or (map-elt agent-pane--state :messages) nil))
+          (when (eq (map-elt msg :role) 'user)
+            (setq found t)))
+        found)))
+
 (defun agent-pane--transcript-ensure-file ()
   "Ensure a transcript file exists for the current agent-pane buffer.
 Return the transcript file path, or nil if transcript saving is disabled."
   (when (agent-pane--transcripts-enabled-p)
     (agent-pane--ensure-state)
-    (unless (map-elt agent-pane--state :transcript-file)
-      (let* ((dir (file-name-as-directory (expand-file-name agent-pane-transcript-directory)))
-             (file (agent-pane--transcript-default-file))
-             (root (directory-file-name (expand-file-name (agent-pane--project-root))))
-             (cmd+params (agent-pane--acp-command-and-params))
-             (cmd (car cmd+params))
-             (params (cdr cmd+params))
-             (header
-              (string-join
-               (list
-                "# agent-pane transcript"
-                ""
-                (format "- created: %s" (format-time-string "%F %T"))
-                (format "- project_root: %s" root)
-                (format "- buffer: %s" (buffer-name))
-                (format "- acp_provider: %s" (or agent-pane-acp-provider 'codex))
-                (format "- auth_method: %s" (or agent-pane-auth-method-id "-"))
-                (format "- session_mode: %s" (or agent-pane-session-mode-id "-"))
-                (format "- session_model: %s" (or agent-pane-session-model-id "-"))
-                (format "- acp_command: %s %s" cmd (string-join (or params nil) " "))
-                ""
-                "---"
-                "")
-               "\n")))
-        (make-directory dir t)
-        (let ((coding-system-for-write 'utf-8-unix))
-          (write-region header nil file nil 'silent))
-        (map-put! agent-pane--state :transcript-file file)
-        ;; If session id is already known, log it now.
-        (agent-pane--transcript-log-session-id)
-        ;; Refresh sidebar if it's open.
-        (when (fboundp 'agent-pane-sessions-refresh-if-visible)
-          (agent-pane-sessions-refresh-if-visible))))
-    (map-elt agent-pane--state :transcript-file)))
+    (when (or (map-elt agent-pane--state :transcript-file)
+              (agent-pane--transcript-has-interaction-p))
+      (unless (map-elt agent-pane--state :transcript-file)
+        (let* ((dir (file-name-as-directory (expand-file-name agent-pane-transcript-directory)))
+               (file (agent-pane--transcript-default-file))
+               (root (directory-file-name (expand-file-name (agent-pane--project-root))))
+               (cmd+params (agent-pane--acp-command-and-params))
+               (cmd (car cmd+params))
+               (params (cdr cmd+params))
+               (header
+                (string-join
+                 (list
+                  "# agent-pane transcript"
+                  ""
+                  (format "- created: %s" (format-time-string "%F %T"))
+                  (format "- project_root: %s" root)
+                  (format "- buffer: %s" (buffer-name))
+                  (format "- acp_provider: %s" (or agent-pane-acp-provider 'codex))
+                  (format "- auth_method: %s" (or agent-pane-auth-method-id "-"))
+                  (format "- session_mode: %s" (or agent-pane-session-mode-id "-"))
+                  (format "- session_model: %s" (or agent-pane-session-model-id "-"))
+                  (format "- acp_command: %s %s" cmd (string-join (or params nil) " "))
+                  ""
+                  "---"
+                  "")
+                 "\n")))
+          (make-directory dir t)
+          (let ((coding-system-for-write 'utf-8-unix))
+            (write-region header nil file nil 'silent))
+          (map-put! agent-pane--state :transcript-file file)
+          ;; If session id is already known, log it now.
+          (agent-pane--transcript-log-session-id)
+          ;; Refresh sidebar if it's open.
+          (when (fboundp 'agent-pane-sessions-refresh-if-visible)
+            (agent-pane-sessions-refresh-if-visible))))
+      (map-elt agent-pane--state :transcript-file))))
 (defun agent-pane--transcript-append (text)
   "Append TEXT to the current transcript file."
   (when-let ((file (agent-pane--transcript-ensure-file)))

@@ -12,6 +12,7 @@
 (require 'agent-pane-state)
 (require 'agent-pane-util)
 (require 'acp) ;; for traffic/log buffers in the header
+(require 'cl-lib)
 (require 'map)
 (require 'subr-x)
 (defvar agent-pane-acp-provider)
@@ -117,6 +118,17 @@ typing in the input area)."
       (t
        "Status: ready"))
      queue-suffix)))
+(defun agent-pane--header-provider-label ()
+  "Return current provider label for header summary/status text."
+  (format "%s" (or agent-pane-acp-provider 'codex)))
+
+(defun agent-pane--ui-header-line ()
+  "Compute the header-line text with status and provider/model metadata."
+  (format "%s  provider=%s  model=%s"
+          (agent-pane--ui-status-line)
+          (agent-pane--header-provider-label)
+          (agent-pane--header-model-label)))
+
 (defun agent-pane--ui-status-face ()
   "Return the face symbol used for the current status line."
   (let ((in-progress (map-elt agent-pane--state :in-progress))
@@ -132,7 +144,7 @@ typing in the input area)."
   (let* ((s (agent-pane--ui-status-line))
          (face (agent-pane--ui-status-face))
          (header (if agent-pane-show-header-line-status
-                     (propertize s 'face face)
+                     (propertize (agent-pane--ui-header-line) 'face face)
                    s)))
     (when agent-pane-show-header-line-status
       (setq-local header-line-format header))
@@ -173,10 +185,12 @@ END is the message end (after trailing blank line)."
        (gethash msg agent-pane--msg-locs)))
 (defun agent-pane--message-label-and-face (msg)
   "Return (LABEL . FACE) for MSG."
-  (let* ((role (map-elt msg :role))
+  (let* ((role0 (map-elt msg :role))
+         (role (if (stringp role0) (intern role0) role0))
+         (queued (and (eq role 'user) (map-elt msg :queued)))
          (title (map-elt msg :title))
          (label (pcase role
-                  ('user "You")
+                  ('user (if queued "You (queued)" "You"))
                   ('assistant "Agent")
                   ('system "System")
                   ('thought "Thought")
@@ -191,12 +205,44 @@ END is the message end (after trailing blank line)."
                  ('tool 'agent-pane-role-tool)
                  ('acp 'agent-pane-role-acp)
                  (_ 'default))))
-    (cons (if (and title
-                   (not (eq role 'tool))
+    (cons (if (and (stringp title)
                    (not (string-empty-p title)))
               (format "%s (%s)" label title)
-            label)
-          face)))
+             label)
+           face)))
+
+(defun agent-pane--ui-queued-message-p (msg)
+  "Return non-nil when MSG is a queued user prompt."
+  (and (eq (map-elt msg :role) 'user)
+       (map-elt msg :queued)))
+
+(defun agent-pane--ui-first-queued-position ()
+  "Return buffer position of first rendered queued message, or nil."
+  (let ((messages (map-elt agent-pane--state :messages))
+        found)
+    (while (and messages (not found))
+      (let ((msg (car messages)))
+        (when (agent-pane--ui-queued-message-p msg)
+          (when-let* ((loc (agent-pane--ui-message-loc msg))
+                      (beg (plist-get loc :beg))
+                      (pos (and (markerp beg) (marker-position beg))))
+            (setq found pos))))
+      (setq messages (cdr messages)))
+    found))
+(defun agent-pane--ui--apply-face-to-lines (beg end face)
+  "Apply FACE to whole lines spanning BEG..END, including line endings."
+  (save-excursion
+    (goto-char beg)
+    (beginning-of-line)
+    (let ((from (point)))
+      (goto-char end)
+      (unless (bolp)
+        (end-of-line))
+      (let ((to (if (< (point) (point-max))
+                    (1+ (point))
+                  (point))))
+        (add-text-properties from to (list 'face face))))))
+
 (defun agent-pane--ui-style-tool-message (beg end)
   "Apply tool-specific styling within message region BEG..END."
   (save-excursion
@@ -204,13 +250,14 @@ END is the message end (after trailing blank line)."
       (narrow-to-region beg end)
       (goto-char (point-min))
       (when (re-search-forward (rx bol "tool:" (* nonl) eol) nil t)
-        (add-text-properties (match-beginning 0) (match-end 0)
-                             '(face agent-pane-tool-invocation-block)))
+        (agent-pane--ui--apply-face-to-lines (match-beginning 0)
+                                             (match-end 0)
+                                             'agent-pane-tool-invocation-block))
       (goto-char (point-min))
-      (when (re-search-forward (rx bol "output (latest " (* nonl) eol) nil t)
+      (when (re-search-forward (rx bol "output (" (or "latest " "full") (* nonl) eol) nil t)
         (let ((block-beg (match-beginning 0)))
-          (add-text-properties block-beg (point-max)
-                               '(face agent-pane-tool-output-block)))))))
+          (agent-pane--ui--apply-face-to-lines block-beg (point-max)
+                                               'agent-pane-tool-output-block))))))
 
 (defun agent-pane--ui-render-message (msg)
   "Insert MSG into current buffer and record marker locations."
@@ -249,15 +296,17 @@ END is the message end (after trailing blank line)."
       (let ((inhibit-read-only t)
             (msgs (map-elt agent-pane--state :messages)))
         (when (< agent-pane--rendered-message-count (length msgs))
-          (goto-char agent-pane--transcript-end-marker)
-          (let ((start (point)))
-            (cl-loop for i from agent-pane--rendered-message-count below (length msgs)
-                     for msg = (nth i msgs)
-                     do (agent-pane--ui-render-message msg)
-                     do (setq-local agent-pane--rendered-message-count (1+ agent-pane--rendered-message-count)))
-            ;; Ensure transcript end marker stays before footer.
-            (set-marker agent-pane--transcript-end-marker start)
-            (set-marker agent-pane--transcript-end-marker (point) (current-buffer))))))))
+          (cl-loop for i from agent-pane--rendered-message-count below (length msgs)
+                   for msg = (nth i msgs)
+                   do (let* ((insert-at
+                              (if (agent-pane--ui-queued-message-p msg)
+                                  (marker-position agent-pane--transcript-end-marker)
+                                (or (agent-pane--ui-first-queued-position)
+                                    (marker-position agent-pane--transcript-end-marker)))))
+                        (goto-char insert-at)
+                        (agent-pane--ui-render-message msg)
+                        (setq-local agent-pane--rendered-message-count
+                                    (1+ agent-pane--rendered-message-count)))))))))
 (defun agent-pane--ui-append-to-message-text (idx chunk)
   "Append CHUNK to message body at IDX in-place."
   (when (agent-pane--ui-layout-ready-p)
@@ -341,18 +390,40 @@ Use this when fields affecting the label (like :title) change."
 (defun agent-pane--ui-insert-footer (input)
   "Insert the footer and editable input area.
 INPUT is the current input contents to restore (or nil)."
-  (agent-pane--insert-read-only "-----\n" 'face 'agent-pane-separator)
-  (setq-local agent-pane--status-beg-marker (point-marker))
-  (agent-pane--insert-read-only (concat (agent-pane--ui-status-line) "\n")
-                                'agent-pane-status t
-                                'face (agent-pane--ui-status-face))
-  (setq-local agent-pane--status-end-marker (point-marker))
-  (agent-pane--insert-read-only
-   "Type your message below and press C-c C-c\n\n"
-   'face 'agent-pane-footer-hint)
-  (setq-local agent-pane--input-marker (point-max-marker))
-  (when (and input (not (string-empty-p input)))
-    (insert input)))
+  (let* ((queue (map-elt agent-pane--state :prompt-queue))
+         (queued (if (listp queue) (length queue) 0))
+         (queue-preview-items nil)
+         (preview
+          (when (> queued 0)
+            (setq queue-preview-items queue)
+            (mapconcat
+             (lambda (item)
+               (string-trim (replace-regexp-in-string "[\n\r]+" " " (or item ""))))
+             (cl-loop for item in queue-preview-items
+                      for i from 1
+                      while (<= i 3)
+                      collect item)
+             "\n"))))
+    (agent-pane--insert-read-only "-----\n" 'face 'agent-pane-separator)
+    (setq-local agent-pane--status-beg-marker (point-marker))
+    (agent-pane--insert-read-only (concat (agent-pane--ui-status-line) "\n")
+                                  'agent-pane-status t
+                                  'face (agent-pane--ui-status-face))
+    (setq-local agent-pane--status-end-marker (point-marker))
+    (when preview
+      (agent-pane--insert-read-only
+       (concat "Queued prompts:\n" preview
+               (if (> queued 3)
+                   (format "\n... and %d more" (- queued 3))
+                 "")
+               "\n\n")
+       'face 'agent-pane-footer-hint))
+    (agent-pane--insert-read-only
+     "Type your message below and press C-c C-c\n\n"
+     'face 'agent-pane-footer-hint)
+    (setq-local agent-pane--input-marker (point-max-marker))
+    (when (and input (not (string-empty-p input)))
+      (insert input))))
 (defun agent-pane--ui-full-render ()
   "Render the entire agent-pane buffer from state.
 This is used on first entry to `agent-pane-mode' and as a fallback if the
@@ -361,7 +432,15 @@ buffer layout gets corrupted."
   (let ((input (agent-pane--input-text)))
     (agent-pane--with-preserved-point
       (let ((inhibit-read-only t)
-            (messages (map-elt agent-pane--state :messages)))
+            (messages
+             (let* ((all (map-elt agent-pane--state :messages))
+                    (normal nil)
+                    (queued nil))
+               (dolist (m all)
+                 (if (agent-pane--ui-queued-message-p m)
+                     (setq queued (append queued (list m)))
+                   (setq normal (append normal (list m)))))
+               (append normal queued))))
         (erase-buffer)
         (when (hash-table-p agent-pane--fold-overlays)
           (maphash (lambda (_msg ov)
@@ -438,11 +517,17 @@ buffer layout gets corrupted."
       0)))
 (defun agent-pane--header-model-label ()
   "Return current model label for compact header summary."
-  (let ((model (and (stringp agent-pane-session-model-id)
-                    (string-trim agent-pane-session-model-id))))
-    (if (and model (not (string-empty-p model)))
-        model
-      "provider-default")))
+  (agent-pane--ensure-state)
+  (let* ((current-model (and (stringp (map-elt agent-pane--state :current-model-id))
+                             (string-trim (map-elt agent-pane--state :current-model-id))))
+         (configured-model (and (stringp agent-pane-session-model-id)
+                                (string-trim agent-pane-session-model-id))))
+    (cond
+     ((and current-model (not (string-empty-p current-model)))
+      current-model)
+     ((and configured-model (not (string-empty-p configured-model)))
+      configured-model)
+     (t "provider-default"))))
 
 (defun agent-pane--render-header ()
   "Insert ACP summary and optional debug details.
@@ -455,11 +540,11 @@ Verbose connection/session/debug fields are shown only when expanded."
            (collapsed (if (local-variable-p 'agent-pane--header-details-collapsed (current-buffer))
                           agent-pane--header-details-collapsed
                         agent-pane-header-details-collapsed)))
-      (agent-pane--insert-read-only
-       (propertize (format "ACP: provider=%s  model=%s  details=%s (C-c v)\n"
-                           (or agent-pane-acp-provider 'codex)
-                           (agent-pane--header-model-label)
-                           (if collapsed "hidden" "shown"))
+       (agent-pane--insert-read-only
+        (propertize (format "ACP: provider=%s  model=%s  details=%s (C-c v)\n"
+                            (agent-pane--header-provider-label)
+                            (agent-pane--header-model-label)
+                            (if collapsed "hidden" "shown"))
                    'face 'agent-pane-header-title)
        'agent-pane-header t
        'agent-pane-raw agent-pane--state)
@@ -590,6 +675,14 @@ for example: `agent-pane--ui-append-to-message-text' and
   (agent-pane--ui-ensure-layout)
   (agent-pane--ui-update-header)
   (agent-pane--ui-update-status-line)
-  (agent-pane--ui-sync-new-messages))
+  (agent-pane--ui-sync-new-messages)
+  ;; When this chat is actively visible, treat current transcript as seen so
+  ;; sidebar "done" indicators clear after the user looks at the thread.
+  (when (and (window-live-p (selected-window))
+             (eq (window-buffer (selected-window)) (current-buffer)))
+    (when (agent-pane--mark-thread-seen)
+      (when (fboundp 'agent-pane-sessions-rerender-if-visible)
+        (ignore-errors
+          (agent-pane-sessions-rerender-if-visible))))))
 (provide 'agent-pane-ui)
 ;;; agent-pane-ui.el ends here

@@ -93,9 +93,12 @@ Diff review is configurable via:
 ## Key bindings (sessions sidebar)
 
 - `RET` replay transcript into chat buffer (reuses right chat pane when sidebar is open)
-  - live status prefixes: `[RUN]`, `[DONE]`, `[WAIT]`
+  - live status indicators (default icons): running `◐`, done `✓`, waiting `…`
+  - done indicator clears after the thread is viewed
+  - optional text style: `[RUN]`, `[DONE]`, `[WAIT]`
 - `o` open raw transcript `.md`
-- `n` new chat for project at point
+- `n` new chat for project at point (prompts for project when not on one)
+- `a` add/select project and start a new chat
 - `/` set filter, `c` clear filter
 - `s` toggle sort (recency/title)
 - `r` rename transcript title (writes header)

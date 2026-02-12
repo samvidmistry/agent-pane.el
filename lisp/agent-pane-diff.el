@@ -8,6 +8,7 @@
 ;;; Code:
 
 (require 'agent-pane-config)
+(require 'cl-lib)
 (require 'diff)
 (require 'diff-mode)
 (require 'ediff)
@@ -35,45 +36,61 @@ Return a cons cell (OLD-TEXT . NEW-TEXT)."
     (cons (string-join (nreverse old-lines) "\n")
           (string-join (nreverse new-lines) "\n"))))
 
+(defun agent-pane--map-elt-any (obj keys)
+  "Return first non-nil value in OBJ for any symbol in KEYS."
+  (let (val)
+    (while (and keys (null val))
+      (setq val (map-elt obj (car keys)))
+      (setq keys (cdr keys)))
+    val))
+
+(defun agent-pane--diff-map-like-p (obj)
+  "Return non-nil when OBJ is an alist map object."
+  (and (listp obj)
+       (consp obj)
+       (consp (car obj))
+       (symbolp (caar obj))))
+
+(defun agent-pane--find-diff-item (obj)
+  "Recursively find first ACP diff object inside OBJ."
+  (cond
+   ((null obj) nil)
+   ((and (agent-pane--diff-map-like-p obj)
+         (equal (map-elt obj 'type) "diff"))
+    obj)
+   ((agent-pane--diff-map-like-p obj)
+    (or (agent-pane--find-diff-item (map-elt obj 'content))
+        (agent-pane--find-diff-item (map-elt obj 'rawOutput))))
+   ((vectorp obj)
+    (seq-some #'agent-pane--find-diff-item (append obj nil)))
+   ((listp obj)
+    (seq-some #'agent-pane--find-diff-item obj))
+   (t nil)))
+
 (defun agent-pane--extract-diff-info (tool-call)
   "Extract structured diff info from TOOL-CALL payload.
 Return plist with keys `:old', `:new', and optional `:file', or nil."
   (let* ((content (map-elt tool-call 'content))
+         (raw-output (map-elt tool-call 'rawOutput))
          (raw-input (map-elt tool-call 'rawInput))
          (diff-item
-          (cond
-           ((and (listp content)
-                 (equal (map-elt content 'type) "diff"))
-            content)
-           ((vectorp content)
-            (seq-find (lambda (item)
-                        (equal (map-elt item 'type) "diff"))
-                      (append content nil)))
-           ((and (listp content)
-                 (listp (car-safe content)))
-            (seq-find (lambda (item)
-                        (equal (map-elt item 'type) "diff"))
-                      content))
-           ((and raw-input (map-elt raw-input 'new_str))
-            `((oldText . ,(or (map-elt raw-input 'old_str) ""))
-              (newText . ,(map-elt raw-input 'new_str))
-              (path . ,(or (map-elt raw-input 'path)
-                           (map-elt raw-input 'fileName)))) )
-           ((and raw-input (map-elt raw-input 'newText))
-            `((oldText . ,(or (map-elt raw-input 'oldText) ""))
-              (newText . ,(map-elt raw-input 'newText))
-              (path . ,(or (map-elt raw-input 'path)
-                           (map-elt raw-input 'fileName)))) )
-           ((and raw-input (map-elt raw-input 'diff))
-            (let ((parsed (agent-pane--parse-unified-diff (map-elt raw-input 'diff))))
-              `((oldText . ,(car parsed))
-                (newText . ,(cdr parsed))
-                (path . ,(or (map-elt raw-input 'fileName)
-                             (map-elt raw-input 'path))))))
-           (t nil))))
-    (when-let* ((new-text (map-elt diff-item 'newText)))
-      (let ((file (map-elt diff-item 'path))
-            (old-text (or (map-elt diff-item 'oldText) "")))
+          (or (agent-pane--find-diff-item content)
+              (agent-pane--find-diff-item raw-output)
+              (when-let ((new-str (agent-pane--map-elt-any raw-input '(newText new_str newString new_text))))
+                `((oldText . ,(or (agent-pane--map-elt-any raw-input '(oldText old_str oldString old_text)) ""))
+                  (newText . ,new-str)
+                  (path . ,(or (agent-pane--map-elt-any raw-input '(path file fileName file_name uri))
+                               ""))))
+              (when-let ((diff-str (agent-pane--map-elt-any raw-input '(diff patch unifiedDiff))))
+                (let ((parsed (agent-pane--parse-unified-diff diff-str)))
+                  `((oldText . ,(car parsed))
+                    (newText . ,(cdr parsed))
+                    (path . ,(or (agent-pane--map-elt-any raw-input '(fileName file_name file path uri))
+                                 ""))))))))
+    (when-let* ((new-text (agent-pane--map-elt-any diff-item '(newText new_str newString new_text))))
+      (let ((file (or (agent-pane--map-elt-any diff-item '(path file fileName file_name uri))
+                      (agent-pane--map-elt-any raw-input '(path file fileName file_name uri))))
+            (old-text (or (agent-pane--map-elt-any diff-item '(oldText old_str oldString old_text)) "")))
         (append (list :old old-text :new new-text)
                 (when (and file (not (string-empty-p (format "%s" file))))
                   (list :file (format "%s" file))))))))
@@ -94,32 +111,57 @@ Return plist with keys `:old', `:new', and optional `:file', or nil."
       (insert (or content "")))
     path))
 
+(defun agent-pane--diff-line-count (text)
+  "Return number of logical lines in TEXT."
+  (if (string-empty-p (or text ""))
+      0
+    (+ (cl-count ?\n text)
+       (if (string-suffix-p "\n" text) 0 1))))
+
+(defun agent-pane--diff-lines (text)
+  "Return logical lines for TEXT without trailing newline sentinel."
+  (if (string-empty-p (or text ""))
+      nil
+    (let ((lines (split-string text "\n" nil)))
+      (if (string-suffix-p "\n" text)
+          (butlast lines)
+        lines))))
+
+(defun agent-pane--insert-unified-diff (diff)
+  "Insert unified diff text for DIFF into current buffer."
+  (let* ((file (or (plist-get diff :file) "unknown"))
+         (old (or (plist-get diff :old) ""))
+         (new (or (plist-get diff :new) ""))
+         (old-count (agent-pane--diff-line-count old))
+         (new-count (agent-pane--diff-line-count new))
+         (old-start (if (zerop old-count) 0 1))
+         (new-start (if (zerop new-count) 0 1)))
+    (insert (format "--- a/%s\n" file))
+    (insert (format "+++ b/%s\n" file))
+    (insert (format "@@ -%d,%d +%d,%d @@\n"
+                    old-start old-count new-start new-count))
+    (dolist (line (agent-pane--diff-lines old))
+      (insert "-" line "\n"))
+    (dolist (line (agent-pane--diff-lines new))
+      (insert "+" line "\n"))))
+
 (defun agent-pane--show-diff-diff-mode (diff &optional title)
   "Show DIFF in a unified `diff-mode' buffer.
 TITLE is shown in the header line when non-nil."
-  (let* ((file (plist-get diff :file))
-         (old-file (agent-pane--diff-temp-file "agent-pane-old" file (plist-get diff :old)))
-         (new-file (agent-pane--diff-temp-file "agent-pane-new" file (plist-get diff :new)))
-         (buf (get-buffer-create "*agent-pane diff*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer buf
-            (let ((inhibit-read-only t)
-                  (diff-mode-read-only nil))
-              (erase-buffer)
-              (diff-no-select old-file new-file "-U3" t buf)
-              (goto-char (point-min))
-              (when (looking-at "^diff .*\n")
-                (delete-region (point) (progn (forward-line 1) (point))))
-              (diff-mode)
-              (read-only-mode 1)
-              (setq-local header-line-format
-                          (concat
-                           (when title (format "%s  |  " title))
-                           "q quit | n/p hunk navigation"))))
-          (pop-to-buffer buf))
-      (ignore-errors (delete-file old-file))
-      (ignore-errors (delete-file new-file)))))
+  (let ((buf (get-buffer-create "*agent-pane diff*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t)
+            (diff-mode-read-only nil))
+        (erase-buffer)
+        (agent-pane--insert-unified-diff diff)
+        (goto-char (point-min))
+        (diff-mode)
+        (read-only-mode 1)
+        (setq-local header-line-format
+                    (concat
+                     (when title (format "%s  |  " title))
+                     "q quit | n/p hunk navigation"))))
+    (pop-to-buffer buf)))
 
 (defun agent-pane--show-diff-ediff (diff)
   "Show DIFF using `ediff-files'."

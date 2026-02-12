@@ -263,6 +263,53 @@
         (should handshake-called)
         (should (equal applied-model "gpt-5"))))))
 
+(ert-deftest agent-pane-set-session-model-interactive-uses-protocol-model-list ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (map-put! agent-pane--state :available-model-ids '("gpt-5" "gpt-5-mini"))
+    (map-put! agent-pane--state :client (list (cons :agent-pane-fake t)))
+    (map-put! agent-pane--state :session-id "s1")
+    (let (completion-prompt completion-collection read-string-called applied-model)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (prompt collection &rest _args)
+                   (setq completion-prompt prompt)
+                   (setq completion-collection collection)
+                   "gpt-5-mini"))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _args)
+                   (setq read-string-called t)
+                   "unused"))
+                ((symbol-function 'agent-pane--set-session-model)
+                 (lambda (model-id &optional on-success _on-failure)
+                   (setq applied-model model-id)
+                   (when (functionp on-success)
+                     (funcall on-success '((ok . t))))))
+                ((symbol-function 'message)
+                 (lambda (&rest _args) nil)))
+        (call-interactively #'agent-pane-set-session-model)
+        (should (string-match-p "protocol list" completion-prompt))
+        (should (equal completion-collection '("gpt-5" "gpt-5-mini")))
+        (should-not read-string-called)
+        (should (equal applied-model "gpt-5-mini"))
+        (should (equal agent-pane-session-model-id "gpt-5-mini"))))))
+
+(ert-deftest agent-pane-on-notification-config-options-update-caches-model-list ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--on-notification
+     '((jsonrpc . "2.0")
+       (method . "session/update")
+       (params . ((sessionId . "s1")
+                  (update . ((sessionUpdate . "config_options_update")
+                             (configOptions . [((id . "model")
+                                                (category . "model")
+                                                (currentValue . "gpt-5")
+                                                (options . [((value . "gpt-5"))
+                                                            ((value . "gpt-5-mini"))]))])))))))
+    (should (equal (map-elt agent-pane--state :available-model-ids)
+                   '("gpt-5" "gpt-5-mini")))
+    (should (equal (map-elt agent-pane--state :current-model-id) "gpt-5"))))
+
 (ert-deftest agent-pane-extract-diff-info-supports-standard-content ()
   (let* ((tool-call '((content . ((type . "diff")
                                   (path . "src/main.el")
@@ -273,6 +320,23 @@
     (should (equal (plist-get diff :old) "a\nb\n"))
     (should (equal (plist-get diff :new) "a\nc\n"))))
 
+(ert-deftest agent-pane-extract-diff-info-supports-nested-content-wrapper ()
+  (let* ((tool-call '((content . [((type . "content")
+                                   (content . ((type . "diff")
+                                               (path . "src/main.el")
+                                               (oldText . "x\n")
+                                               (newText . "y\n"))))])))
+         (diff (agent-pane--extract-diff-info tool-call)))
+    (should (equal (plist-get diff :file) "src/main.el"))
+    (should (equal (plist-get diff :old) "x\n"))
+    (should (equal (plist-get diff :new) "y\n"))))
+
+(ert-deftest agent-pane-merge-tool-output-preserves-complete-stream ()
+  (should (equal (agent-pane--merge-tool-output nil "abc") "abc"))
+  (should (equal (agent-pane--merge-tool-output "abc" "abcdef") "abcdef"))
+  (should (equal (agent-pane--merge-tool-output "abc" "def") "abcdef"))
+  (should (equal (agent-pane--merge-tool-output "abcdef" "") "abcdef")))
+
 (ert-deftest agent-pane-tool-call-content-string-skips-diff-items ()
   (let* ((content [((type . "diff")
                     (path . "src/main.el")
@@ -282,6 +346,28 @@
                     (content . ((text . "hello"))))])
          (s (agent-pane--tool-call-content->string content)))
     (should (equal s "hello"))))
+
+(ert-deftest agent-pane-tool-call-content-string-handles-wrapped-map ()
+  (let* ((content '((type . "content")
+                    (content . ((type . "text")
+                                (text . "Codex says hi")
+                                (_meta . ((stage . "analysis")))))
+                    (uri . "codex://tool")))
+         (s (agent-pane--tool-call-content->string content)))
+    (should (equal s "Codex says hi"))))
+
+(ert-deftest agent-pane-tool-call-content-string-handles-single-text-pair ()
+  (let* ((content '((text . "Hello")))
+         (s (agent-pane--tool-call-content->string content)))
+    (should (equal s "Hello"))))
+
+(ert-deftest agent-pane-tool-call-content-string-handles-thinking-field ()
+  (let* ((content '((type . "reasoning")
+                    (title . "Planning")
+                    (thinking . ((type . "text")
+                                 (text . "Detailed reasoning text")))))
+         (s (agent-pane--tool-call-content->string content)))
+    (should (equal s "Detailed reasoning text"))))
 
 (ert-deftest agent-pane-view-diff-at-point-opens-tool-diff ()
   (with-temp-buffer
@@ -299,6 +385,35 @@
                    (setq shown d))))
         (agent-pane-view-diff-at-point)
         (should (equal shown diff))))))
+
+(ert-deftest agent-pane-show-diff-diff-mode-renders-without-external-diff ()
+  (let ((diff '(:file "src/main.el" :old "a\nb\n" :new "a\nc\n"))
+        shown-buf)
+    (unwind-protect
+        (cl-letf (((symbol-function 'diff-no-select)
+                   (lambda (&rest _args)
+                     (ert-fail "agent-pane--show-diff-diff-mode should not call diff-no-select")))
+                  ((symbol-function 'pop-to-buffer)
+                   (lambda (buf &rest _args)
+                     (setq shown-buf buf)
+                     buf)))
+          (agent-pane--show-diff-diff-mode diff "Diff title")
+          (with-current-buffer shown-buf
+            (should (eq major-mode 'diff-mode))
+            (should (string-match-p
+                     (regexp-quote
+                      (string-join '("--- a/src/main.el"
+                                     "+++ b/src/main.el"
+                                     "@@ -1,2 +1,2 @@"
+                                     "-a"
+                                     "-b"
+                                     "+a"
+                                     "+c"
+                                     "")
+                                   "\n"))
+                     (buffer-string)))))
+      (when (buffer-live-p shown-buf)
+        (kill-buffer shown-buf)))))
 
 (ert-deftest agent-pane-tool-call-entry-to-text-shows-last-five-lines ()
   (let* ((agent-pane-tool-output-preview-lines 5)
@@ -322,6 +437,32 @@
     (should (string-match-p "l1" text))
     (should (string-match-p "l3" text))
     (should-not (string-match-p "latest" text))))
+
+(ert-deftest agent-pane-tool-call-entry-to-text-includes-params ()
+  (let* ((entry (list :title "functions.shell_command"
+                      :command "shell_command"
+                      :params '((command . "Get-ChildItem -Force")
+                                (workdir . "c:/Projects/agent-mode"))))
+         (text (agent-pane--tool-call-entry-to-text entry)))
+    (should (string-match-p "^tool: functions\\.shell_command shell_command" text))
+    (should (string-match-p "params:" text))
+    (should (string-match-p "Get-ChildItem -Force" text))
+    (should (string-match-p "workdir" text))))
+
+(ert-deftest agent-pane-tool-call-display-title-avoids-opaque-call-id ()
+  (let* ((entry (list :toolCallId "call_utRvJt9VSAqk8sir0WFmIpxH"
+                      :title "call_utRvJt9VSAqk8sir0WFmIpxH"
+                      :kind "functions.shell_command"
+                      :params '((command . "Get-ChildItem -Force"))))
+         (title (agent-pane--tool-call-display-title entry)))
+    (should (string-match-p "Get-ChildItem -Force" title))
+    (should-not (string-match-p (rx string-start "call_") title))))
+
+(ert-deftest agent-pane-tool-call-display-title-falls-back-to-generic-for-opaque-id ()
+  (let* ((entry (list :toolCallId "call_utRvJt9VSAqk8sir0WFmIpxH"
+                      :title "call_utRvJt9VSAqk8sir0WFmIpxH"))
+         (title (agent-pane--tool-call-display-title entry)))
+    (should (equal title "tool call"))))
 
 (ert-deftest agent-pane-toggle-tool-output-mode-refreshes-tool-messages ()
   (with-temp-buffer
@@ -362,6 +503,23 @@
       (should (eq (get-text-property line-beg 'face)
                   'agent-pane-tool-output-block)))))
 
+(ert-deftest agent-pane-tool-message-full-output-header-has-output-face ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'tool
+                                 :title "bash"
+                                 :text "tool: bash echo hi\n\noutput (full):\nok")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (search-forward "output (full):")
+    (let ((line-beg (line-beginning-position)))
+      (should (eq (get-text-property line-beg 'face)
+                  'agent-pane-tool-output-block)))))
+
+(ert-deftest agent-pane-tool-block-faces-extend-to-window-edge ()
+  (should (eq (face-attribute 'agent-pane-tool-invocation-block :extend nil 'default) t))
+  (should (eq (face-attribute 'agent-pane-tool-output-block :extend nil 'default) t)))
+
 (ert-deftest agent-pane-exit-keybindings-present ()
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c ."))
               #'agent-pane-dispatch))
@@ -370,17 +528,17 @@
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-q"))
               #'agent-pane-exit))
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-v"))
-              #'agent-pane-toggle-header-details))
+              #'agent-pane-toggle-header-details-anywhere))
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c v"))
-              #'agent-pane-toggle-header-details))
+              #'agent-pane-toggle-header-details-anywhere))
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c m"))
               #'agent-pane-set-session-model))
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-m"))
               #'agent-pane-set-session-model))
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c d"))
-              #'agent-pane-view-diff-at-point))
+              #'agent-pane-view-diff-at-point-anywhere))
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-d"))
-              #'agent-pane-view-diff-at-point))
+              #'agent-pane-view-diff-at-point-anywhere))
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c o"))
               #'agent-pane-toggle-tool-output-mode))
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-o"))
@@ -390,7 +548,15 @@
   (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-i"))
               #'agent-pane-edit-input))
   (should (eq (lookup-key agent-pane-sessions-mode-map (kbd "q"))
-              #'agent-pane-exit)))
+              #'agent-pane-exit))
+  (should (eq (lookup-key agent-pane-input-editor-mode-map (kbd "C-c v"))
+              #'agent-pane-toggle-header-details-anywhere))
+  (should (eq (lookup-key agent-pane-input-editor-mode-map (kbd "C-c C-v"))
+              #'agent-pane-toggle-header-details-anywhere))
+  (should (eq (lookup-key agent-pane-input-editor-mode-map (kbd "C-c d"))
+              #'agent-pane-view-diff-at-point-anywhere))
+  (should (eq (lookup-key agent-pane-input-editor-mode-map (kbd "C-c C-d"))
+              #'agent-pane-view-diff-at-point-anywhere)))
 
 (ert-deftest agent-pane-header-summary-is-compact-when-collapsed ()
   (let ((agent-pane-show-acp-header t)
@@ -405,6 +571,23 @@
         (should (string-match-p "model=gpt-5" s))
         (should-not (string-match-p "authMethods:" s))))))
 
+(ert-deftest agent-pane-toggle-header-details-anywhere-works-from-non-chat-buffer ()
+  (let ((chat (get-buffer-create "*agent-pane header-toggle-anywhere*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat
+            (agent-pane-mode)
+            (setq-local agent-pane--header-details-collapsed t))
+          (with-temp-buffer
+            (special-mode)
+            (cl-letf (((symbol-function 'agent-pane--find-chat-buffer-anywhere)
+                       (lambda () chat)))
+              (agent-pane-toggle-header-details-anywhere)))
+          (with-current-buffer chat
+            (should-not agent-pane--header-details-collapsed)))
+      (when (buffer-live-p chat)
+        (kill-buffer chat)))))
+
 (ert-deftest agent-pane-toggle-header-details-expands-debug-section ()
   (let ((agent-pane-show-acp-header t)
         (agent-pane-header-details-collapsed t))
@@ -417,6 +600,29 @@
       (should-not (string-match-p "Server: protocolVersion=" (buffer-string)))
       (agent-pane-toggle-header-details)
       (should (string-match-p "Server: protocolVersion=" (buffer-string))))))
+
+(ert-deftest agent-pane-cancel-clears-queued-prompts ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (let ((agent-pane-enable-acp t)
+          (noninteractive nil)
+          sent)
+      (map-put! agent-pane--state :client 'dummy-client)
+      (map-put! agent-pane--state :session-id "s1")
+      (map-put! agent-pane--state :prompt-in-flight t)
+      (map-put! agent-pane--state :in-progress 'streaming)
+      (map-put! agent-pane--state :prompt-queue '("keep?" "drop?"))
+      (map-put! agent-pane--state :queued-prompts '(ignore))
+      (cl-letf (((symbol-function 'agent-pane--acp-send-notification)
+                 (lambda (&rest args)
+                   (setq sent (plist-get args :notification)))))
+        (agent-pane-cancel))
+      (should (equal (map-elt sent :method) "session/cancel"))
+      (should (null (map-elt agent-pane--state :prompt-in-flight)))
+      (should (null (map-elt agent-pane--state :in-progress)))
+      (should (null (map-elt agent-pane--state :prompt-queue)))
+      (should (null (map-elt agent-pane--state :prompt-queue-message-indices)))
+      (should (null (map-elt agent-pane--state :queued-prompts))))))
 
 (ert-deftest agent-pane-exit-closes-app-buffers ()
   (let* ((chat (get-buffer-create agent-pane-buffer-name))
@@ -441,17 +647,54 @@
       (ignore-errors (kill-buffer sessions))
       (ignore-errors (kill-buffer input)))))
 
+(ert-deftest agent-pane-exit-closes-all-chat-buffers ()
+  (let* ((chat-main (get-buffer-create agent-pane-buffer-name))
+         (chat-new (generate-new-buffer "*agent-pane<new>*"))
+         (sessions (get-buffer-create agent-pane-sessions-buffer-name))
+         (input (get-buffer-create agent-pane-input-editor-buffer-name))
+         (client-main '((main . t)))
+         (client-new '((new . t)))
+         shutdown-clients)
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-main
+            (agent-pane-mode)
+            (map-put! agent-pane--state :client client-main))
+          (with-current-buffer chat-new
+            (agent-pane-mode)
+            (map-put! agent-pane--state :client client-new))
+          (cl-letf (((symbol-function 'acp-shutdown)
+                     (lambda (&key client)
+                       (push client shutdown-clients))))
+            (agent-pane-exit))
+          (should (member client-main shutdown-clients))
+          (should (member client-new shutdown-clients))
+          (should (= (length shutdown-clients) 2))
+          (should-not (buffer-live-p chat-main))
+          (should-not (buffer-live-p chat-new))
+          (should-not (buffer-live-p sessions))
+          (should-not (buffer-live-p input)))
+      (ignore-errors (kill-buffer chat-main))
+      (ignore-errors (kill-buffer chat-new))
+      (ignore-errors (kill-buffer sessions))
+      (ignore-errors (kill-buffer input)))))
+
 (ert-deftest agent-pane-ui-status-line-shows-waiting ()
-  (with-temp-buffer
-    (agent-pane-mode)
-    (map-put! agent-pane--state :in-progress 'waiting)
-    (agent-pane--rerender)
-    (let* ((start (marker-position agent-pane--status-beg-marker))
-           (end (marker-position agent-pane--status-end-marker))
-           (s (buffer-substring-no-properties start end)))
-      (should (string-match-p "waiting for agent" s))
-      (should (eq (get-text-property start 'face) 'agent-pane-status-busy))
-      (should (string-match-p "waiting for agent" (format "%s" header-line-format))))))
+  (let ((agent-pane-acp-provider 'copilot)
+        (agent-pane-session-model-id "gpt-5"))
+    (with-temp-buffer
+      (agent-pane-mode)
+      (map-put! agent-pane--state :in-progress 'waiting)
+      (agent-pane--rerender)
+      (let* ((start (marker-position agent-pane--status-beg-marker))
+             (end (marker-position agent-pane--status-end-marker))
+             (s (buffer-substring-no-properties start end))
+             (h (format "%s" header-line-format)))
+        (should (string-match-p "waiting for agent" s))
+        (should (eq (get-text-property start 'face) 'agent-pane-status-busy))
+        (should (string-match-p "waiting for agent" h))
+        (should (string-match-p "provider=copilot" h))
+        (should (string-match-p "model=gpt-5" h))))))
 
 (ert-deftest agent-pane-prompt-queue-sends-followups-in-order ()
   (with-temp-buffer
@@ -474,6 +717,106 @@
         (agent-pane--enqueue-prompt "second")
         (agent-pane--pump-prompt-queue)
         (should (equal (nreverse sent) '("first" "second")))
+        (should (null (map-elt agent-pane--state :prompt-queue)))))))
+
+(ert-deftest agent-pane-prompt-queue-clears-queued-flag-when-sent ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (let ((agent-pane-enable-acp t)
+          (noninteractive nil)
+          sent)
+      (map-put! agent-pane--state :client (list (cons :agent-pane-fake t)))
+      (map-put! agent-pane--state :session-id "fake")
+      (let ((idx (agent-pane--append-message* :role 'user :text "queued prompt")))
+        (agent-pane--set-message-queued idx t)
+        (agent-pane--enqueue-prompt "queued prompt" idx)
+        (cl-letf (((symbol-function 'agent-pane--send-prompt)
+                   (lambda (text)
+                     (push text sent))))
+          (agent-pane--pump-prompt-queue))
+        (should (equal sent '("queued prompt")))
+        (should-not (map-elt (nth idx (map-elt agent-pane--state :messages)) :queued))
+        (should (null (map-elt agent-pane--state :prompt-queue-message-indices)))))))
+
+(ert-deftest agent-pane-ui-keeps-queued-user-messages-at-bottom ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'assistant :text "Current answer")
+    (let ((queued-idx (agent-pane--append-message* :role 'user :text "Second request")))
+      (agent-pane--set-message-queued queued-idx t)
+      (agent-pane--rerender)
+      (agent-pane--append-message* :role 'tool :title "shell_command" :text "tool: shell_command")
+      (agent-pane--rerender)
+      (let* ((s (buffer-string))
+             (tool-pos (string-match (regexp-quote "Tool (shell_command):") s))
+             (queued-pos (string-match (regexp-quote "You (queued):") s)))
+        (should (numberp tool-pos))
+        (should (numberp queued-pos))
+        (should (< tool-pos queued-pos))))))
+
+(ert-deftest agent-pane-submit-marks-followup-user-message-queued-while-streaming ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (let ((agent-pane-enable-acp t)
+          (noninteractive nil))
+      (map-put! agent-pane--state :client (list (cons :agent-pane-fake t)))
+      (map-put! agent-pane--state :session-id "s-stream")
+      (map-put! agent-pane--state :in-progress 'streaming)
+      (goto-char (point-max))
+      (insert "follow-up")
+      (agent-pane-submit)
+      (let* ((msgs (map-elt agent-pane--state :messages))
+             (m0 (nth 0 msgs)))
+        (should (= (length msgs) 1))
+        (should (eq (map-elt m0 :role) 'user))
+        (should (map-elt m0 :queued))
+        (should (equal (map-elt agent-pane--state :prompt-queue) '("follow-up")))
+        (should (equal (map-elt agent-pane--state :prompt-queue-message-indices) '(0)))
+        (should (string-match-p "You (queued):" (buffer-string)))))))
+
+(ert-deftest agent-pane-prompt-queue-drains-after-external-connect ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (let ((agent-pane-enable-acp t)
+          (noninteractive nil)
+          (agent-pane-auth-method-id nil)
+          (sent nil)
+          initialize-success
+          session-new-success
+          session-set-mode-success)
+      (map-put! agent-pane--state :client (list (cons :agent-pane-fake t)))
+      (cl-letf (((symbol-function 'agent-pane--ensure-acp-client)
+                 (lambda () nil))
+                ((symbol-function 'agent-pane--subscribe)
+                 (lambda () nil))
+                ((symbol-function 'agent-pane--acp-send-request)
+                 (lambda (&rest args)
+                   (let* ((request (plist-get args :request))
+                          (on-success (plist-get args :on-success))
+                          (method (or (map-elt request :method)
+                                      (map-elt request 'method))))
+                     (pcase method
+                       ("initialize" (setq initialize-success on-success))
+                       ("session/new" (setq session-new-success on-success))
+                       ("session/set_mode" (setq session-set-mode-success on-success))
+                       (_ (ert-fail (format "Unexpected ACP method: %S" method)))))))
+                ((symbol-function 'agent-pane--send-prompt)
+                 (lambda (text)
+                   (push text sent))))
+        ;; Simulate a connection started by another command (provider switch/model apply).
+        (agent-pane--handshake (lambda () nil))
+        (should (map-elt agent-pane--state :connecting))
+        ;; Queue and pump while still connecting. This must register a post-connect drain.
+        (agent-pane--enqueue-prompt "queued while connecting")
+        (agent-pane--pump-prompt-queue)
+        (agent-pane--pump-prompt-queue)
+        (should (equal (map-elt agent-pane--state :queued-prompts)
+                       '(agent-pane--pump-prompt-queue)))
+        ;; Finish handshake and verify queued prompt is sent automatically.
+        (funcall initialize-success '((protocolVersion . 1)))
+        (funcall session-new-success '((sessionId . "s-connect")))
+        (funcall session-set-mode-success '((ok . t)))
+        (should (equal sent '("queued while connecting")))
         (should (null (map-elt agent-pane--state :prompt-queue)))))))
 
 (ert-deftest agent-pane-ui-streaming-does-not-erase-buffer ()
@@ -580,6 +923,27 @@
     (let ((beg (match-beginning 0)))
       (should (eq (get-text-property beg 'invisible) 'agent-pane-markup))
       (should (eq (get-text-property (+ beg 2) 'face) 'agent-pane-markdown-strong-thought)))))
+
+(ert-deftest agent-pane-markdown-thought-body-has-thought-face ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'thought :text "plain thought text")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (should (search-forward "plain thought text" nil t))
+    (should (eq (get-text-property (match-beginning 0) 'face)
+                'agent-pane-role-thought))))
+
+(ert-deftest agent-pane-tool-label-includes-title ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message*
+     :role 'tool
+     :title "shell_command"
+     :text "tool: shell_command")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (should (search-forward "Tool (shell_command):" nil t))))
 
 (ert-deftest agent-pane-markdown-strong-spans-chunk-boundary ()
   (with-temp-buffer

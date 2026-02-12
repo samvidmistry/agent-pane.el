@@ -13,6 +13,12 @@
   (let ((coding-system-for-write 'utf-8-unix))
     (write-region content nil file nil 'silent)))
 
+(defun agent-pane-test--face-has-p (face target)
+  "Return non-nil when FACE includes TARGET."
+  (if (listp face)
+      (memq target face)
+    (eq face target)))
+
 (ert-deftest agent-pane-sessions-scan-groups-by-project-root ()
   (let* ((dir (make-temp-file "agent-pane-transcripts" t))
          (agent-pane-transcript-directory dir)
@@ -98,6 +104,61 @@
             (goto-char (point-min))
             (re-search-forward "^\\*\\* " nil t)
             (should (stringp (get-text-property (point) 'agent-pane-session-file)))))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest agent-pane-sessions-renders-active-session-with-highlight-face ()
+  (let* ((dir (make-temp-file "agent-pane-transcripts" t))
+         (agent-pane-transcript-directory dir)
+         (f-active (expand-file-name "20260102-010101--proj--active.md" dir))
+         (f-idle (expand-file-name "20260101-010101--proj--idle.md" dir))
+         (sessions-buf (get-buffer-create agent-pane-sessions-buffer-name))
+         (chat-buf (get-buffer-create "*agent-pane active-session*")))
+    (unwind-protect
+        (progn
+          (dolist (spec `((,f-active "Active session" "2026-01-02 01:01:01")
+                          (,f-idle "Idle session" "2026-01-01 01:01:01")))
+            (agent-pane-test--write
+             (nth 0 spec)
+             (string-join
+              `(,"# agent-pane transcript"
+                ""
+                ,(format "- created: %s" (nth 2 spec))
+                ,(format "- title: %s" (nth 1 spec))
+                "- project_root: /tmp/proj"
+                ""
+                "---")
+              "\n")))
+          (save-window-excursion
+            (delete-other-windows)
+            (let* ((main (selected-window))
+                   (side (split-window main agent-pane-sessions-sidebar-width 'left)))
+              (set-window-buffer side sessions-buf)
+              (set-window-dedicated-p side t)
+              (set-window-buffer main chat-buf)
+              (with-current-buffer chat-buf
+                (setq default-directory "/tmp/proj/")
+                (agent-pane-mode)
+                (map-put! agent-pane--state :transcript-file f-active))
+              (select-window side)
+              (with-current-buffer sessions-buf
+                (agent-pane-sessions-mode)
+                (agent-pane-sessions-refresh)
+                (should (agent-pane-sessions--goto-prop-value
+                         'agent-pane-session-file f-active))
+                (should (eq (get-text-property (point) 'agent-pane-session-active) t))
+                (should (agent-pane-test--face-has-p
+                         (get-text-property (line-beginning-position) 'face)
+                         'agent-pane-sessions-active-session))
+                (should (agent-pane-sessions--goto-prop-value
+                         'agent-pane-session-file f-idle))
+                (should-not (get-text-property (point) 'agent-pane-session-active))
+                (should-not (agent-pane-test--face-has-p
+                             (get-text-property (line-beginning-position) 'face)
+                             'agent-pane-sessions-active-session))))))
+      (when (buffer-live-p chat-buf)
+        (kill-buffer chat-buf))
+      (when (buffer-live-p sessions-buf)
+        (kill-buffer sessions-buf))
       (ignore-errors (delete-directory dir t)))))
 
 (ert-deftest agent-pane-sessions-sidebar-collapses-project ()
@@ -247,6 +308,49 @@
         (kill-buffer chat-buf))
       (ignore-errors (delete-directory dir t)))))
 
+(ert-deftest agent-pane-sessions-open-at-point-positions-new-chat-at-input ()
+  (let* ((dir (make-temp-file "agent-pane-transcripts" t))
+         (agent-pane-transcript-directory dir)
+         (f (expand-file-name "20260101-010101--proj--aaaa1111.md" dir))
+         (agent-pane-buffer-name "*agent-pane replay test*")
+         (chat-buf nil))
+    (unwind-protect
+        (progn
+          (agent-pane-test--write
+           f
+           (string-join
+            '("# agent-pane transcript"
+              ""
+              "- created: 2026-01-01 01:01:01"
+              "- project_root: /tmp/proj"
+              ""
+              "---"
+              ""
+              "## User — 2026-01-01 01:01:02"
+              ""
+              "hello")
+            "\n"))
+          (let (opened)
+            (with-temp-buffer
+              (insert "** session\n")
+              (add-text-properties (point-min) (point-max)
+                                   (list 'agent-pane-session-file f
+                                         'agent-pane-project-root "/tmp/proj"))
+              (goto-char (point-min))
+              (cl-letf (((symbol-function 'pop-to-buffer)
+                         (lambda (buf &rest _args)
+                           (push buf opened)
+                           buf)))
+                (agent-pane-sessions-open-at-point)))
+            (setq chat-buf (car opened)))
+          (should (buffer-live-p chat-buf))
+          (with-current-buffer chat-buf
+            (should (markerp agent-pane--input-marker))
+            (should (= (point) (marker-position agent-pane--input-marker)))))
+      (when (buffer-live-p chat-buf)
+        (kill-buffer chat-buf))
+      (ignore-errors (delete-directory dir t)))))
+
 (ert-deftest agent-pane-sessions-open-at-point-reuses-right-pane-when-sidebar-visible ()
   (let* ((dir (make-temp-file "agent-pane-transcripts" t))
          (agent-pane-transcript-directory dir)
@@ -299,6 +403,66 @@
                 (should (equal (map-elt agent-pane--state :transcript-file) f))))))
       (ignore-errors (kill-buffer sessions-buf))
       (ignore-errors (kill-buffer scratch-right))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest agent-pane-sessions-open-at-point-preserves-point-for-existing-buffer ()
+  (let* ((dir (make-temp-file "agent-pane-transcripts" t))
+         (agent-pane-transcript-directory dir)
+         (f (expand-file-name "20260101-010101--proj--aaaa1111.md" dir))
+         (agent-pane-buffer-name "*agent-pane replay test*")
+         (opened nil)
+         (chat-buf nil)
+         (saved-point nil))
+    (unwind-protect
+        (progn
+          (agent-pane-test--write
+           f
+           (string-join
+            '("# agent-pane transcript"
+              ""
+              "- created: 2026-01-01 01:01:01"
+              "- project_root: /tmp/proj"
+              ""
+              "---"
+              ""
+              "## User — 2026-01-01 01:01:02"
+              ""
+              "hello"
+              ""
+              "## Agent — 2026-01-01 01:01:03"
+              ""
+              "world")
+            "\n"))
+          (cl-letf (((symbol-function 'pop-to-buffer)
+                     (lambda (buf &rest _args)
+                       (push buf opened)
+                       buf)))
+            (with-temp-buffer
+              (insert "** session\n")
+              (add-text-properties (point-min) (point-max)
+                                   (list 'agent-pane-session-file f
+                                         'agent-pane-project-root "/tmp/proj"))
+              (goto-char (point-min))
+              (agent-pane-sessions-open-at-point))
+            (setq chat-buf (car opened))
+            (with-current-buffer chat-buf
+              (goto-char (point-min))
+              (setq saved-point (point)))
+            (with-temp-buffer
+              (insert "** session\n")
+              (add-text-properties (point-min) (point-max)
+                                   (list 'agent-pane-session-file f
+                                         'agent-pane-project-root "/tmp/proj"))
+              (goto-char (point-min))
+              (agent-pane-sessions-open-at-point)))
+          (should (= (length opened) 2))
+          (should (eq (nth 0 opened) (nth 1 opened)))
+          (should (buffer-live-p chat-buf))
+          (with-current-buffer chat-buf
+            (should (= (point) saved-point))
+            (should (equal (map-elt agent-pane--state :transcript-file) f))))
+      (when (buffer-live-p chat-buf)
+        (kill-buffer chat-buf))
       (ignore-errors (delete-directory dir t)))))
 
 (ert-deftest agent-pane-sessions-open-at-point-keeps-existing-running-buffer ()
@@ -376,6 +540,7 @@
 (ert-deftest agent-pane-sessions-status-indicators-render-live-state ()
   (let* ((dir (make-temp-file "agent-pane-transcripts" t))
          (agent-pane-transcript-directory dir)
+         (agent-pane-sessions-status-style 'text)
          (agent-pane-buffer-name "*agent-pane replay test*")
          (f-run (expand-file-name "20260101-010101--proj--run.md" dir))
          (f-done (expand-file-name "20260102-010101--proj--done.md" dir))
@@ -425,6 +590,113 @@
       (dolist (b (list buf-run buf-done buf-wait))
         (when (buffer-live-p b)
           (kill-buffer b)))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest agent-pane-sessions-done-status-clears-after-thread-is-seen ()
+  (let* ((dir (make-temp-file "agent-pane-transcripts" t))
+         (agent-pane-transcript-directory dir)
+         (agent-pane-sessions-status-style 'text)
+         (f (expand-file-name "20260101-010101--proj--done.md" dir))
+         (chat-buf nil))
+    (unwind-protect
+        (progn
+          (agent-pane-test--write
+           f
+           (string-join
+            '("# agent-pane transcript"
+              ""
+              "- created: 2026-01-01 01:01:01"
+              "- title: Done clears"
+              "- project_root: /tmp/proj"
+              ""
+              "---")
+            "\n"))
+          (setq chat-buf (get-buffer-create "*agent-pane status-done-clear*"))
+          (with-current-buffer chat-buf
+            (setq default-directory "/tmp/proj/")
+            (agent-pane-mode)
+            (map-put! agent-pane--state :transcript-file f)
+            (agent-pane--append-message* :role 'assistant :text "done"))
+          (let ((session (agent-pane-sessions--parse-transcript-metadata f)))
+            (should (eq (agent-pane-sessions--session-status session) 'done))
+            (with-current-buffer chat-buf
+              (agent-pane--mark-thread-seen))
+            (should (eq (agent-pane-sessions--session-status session) 'waiting-input))))
+      (when (buffer-live-p chat-buf)
+        (kill-buffer chat-buf))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest agent-pane-sessions-status-indicators-support-icon-style ()
+  (let* ((dir (make-temp-file "agent-pane-transcripts" t))
+         (agent-pane-transcript-directory dir)
+         (agent-pane-sessions-status-style 'icons)
+         (agent-pane-sessions-status-animate-running nil)
+         (f-done (expand-file-name "20260101-010101--proj--done.md" dir))
+         (chat-buf nil))
+    (unwind-protect
+        (progn
+          (agent-pane-test--write
+           f-done
+           (string-join
+            '("# agent-pane transcript"
+              ""
+              "- created: 2026-01-01 01:01:01"
+              "- title: Icon done"
+              "- project_root: /tmp/proj"
+              ""
+              "---")
+            "\n"))
+          (setq chat-buf (get-buffer-create "*agent-pane status-icon*"))
+          (with-current-buffer chat-buf
+            (setq default-directory "/tmp/proj/")
+            (agent-pane-mode)
+            (map-put! agent-pane--state :transcript-file f-done)
+            (agent-pane--append-message* :role 'assistant :text "done"))
+          (with-temp-buffer
+            (agent-pane-sessions-mode)
+            (should (save-excursion
+                      (goto-char (point-min))
+                      (re-search-forward "^\\*\\* ✓ Icon done" nil t)))))
+      (when (buffer-live-p chat-buf)
+        (kill-buffer chat-buf))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest agent-pane-sessions-running-status-uses-static-icon ()
+  (let* ((dir (make-temp-file "agent-pane-transcripts" t))
+         (agent-pane-transcript-directory dir)
+         (agent-pane-sessions-status-style 'icons)
+         (agent-pane-sessions-status-animate-running nil)
+         (agent-pane-sessions-running-icon-frames ["•"])
+         (f-run (expand-file-name "20260101-010101--proj--run.md" dir))
+         (chat-buf nil))
+    (unwind-protect
+        (progn
+          (agent-pane-test--write
+           f-run
+           (string-join
+            '("# agent-pane transcript"
+              ""
+              "- created: 2026-01-01 01:01:01"
+              "- title: Icon running"
+              "- project_root: /tmp/proj"
+              ""
+              "---")
+            "\n"))
+          (setq chat-buf (get-buffer-create "*agent-pane status-running-icon*"))
+          (with-current-buffer chat-buf
+            (setq default-directory "/tmp/proj/")
+            (agent-pane-mode)
+            (map-put! agent-pane--state :transcript-file f-run)
+            (map-put! agent-pane--state :in-progress 'streaming))
+          (with-temp-buffer
+            (agent-pane-sessions-mode)
+            (should (save-excursion
+                      (goto-char (point-min))
+                      (re-search-forward "^\\*\\* • Icon running" nil t)))
+            (should-not (timerp agent-pane-sessions--status-animation-timer))))
+      (agent-pane-sessions--stop-status-animation)
+      (when (buffer-live-p chat-buf)
+        (kill-buffer chat-buf))
       (ignore-errors (delete-directory dir t)))))
 
 (ert-deftest agent-pane-sessions-filter-shows-matching-session ()
@@ -562,9 +834,81 @@
           (should-not (file-exists-p f)))
       (ignore-errors (delete-directory dir t)))))
 
+(ert-deftest agent-pane-sessions-delete-at-point-kills-open-chat-buffer ()
+  (let* ((dir (make-temp-file "agent-pane-transcripts" t))
+         (agent-pane-transcript-directory dir)
+         (f (expand-file-name "20260101-010101--proj--aaaa1111.md" dir))
+         (chat-buf nil))
+    (unwind-protect
+        (progn
+          (agent-pane-test--write
+           f
+           (string-join
+            '("# agent-pane transcript"
+              ""
+              "- created: 2026-01-01 01:01:01"
+              "- title: Delete me"
+              "- project_root: /tmp/proj"
+              ""
+              "---")
+            "\n"))
+          (setq chat-buf (generate-new-buffer "*agent-pane delete-open*"))
+          (with-current-buffer chat-buf
+            (setq default-directory "/tmp/proj/")
+            (agent-pane-mode)
+            (map-put! agent-pane--state :transcript-file f))
+          (with-temp-buffer
+            (agent-pane-sessions-mode)
+            (goto-char (point-min))
+            (re-search-forward "^\\*\\* " nil t)
+            (beginning-of-line)
+            (cl-letf (((symbol-function 'y-or-n-p)
+                       (lambda (&rest _args) t)))
+              (agent-pane-sessions-delete-at-point)))
+          (should-not (file-exists-p f))
+          (should-not (buffer-live-p chat-buf)))
+      (when (buffer-live-p chat-buf)
+        (kill-buffer chat-buf))
+      (ignore-errors (delete-directory dir t)))))
+
+(ert-deftest agent-pane-sessions-new-chat-prompts-for-project-when-no-project-at-point ()
+  (let* ((proj (make-temp-file "agent-pane-project" t))
+         (agent-pane-buffer-name "*agent-pane project picker*")
+         (opened nil))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (cl-letf (((symbol-function 'read-directory-name)
+                       (lambda (&rest _args) proj))
+                      ((symbol-function 'pop-to-buffer)
+                       (lambda (buf &rest _args)
+                         (push buf opened)
+                         buf)))
+              (agent-pane-sessions-new-chat)))
+          (let ((chat-buf (car opened)))
+            (should (buffer-live-p chat-buf))
+            (with-current-buffer chat-buf
+              (should (derived-mode-p 'agent-pane-mode))
+              (should (equal default-directory
+                             (file-name-as-directory (expand-file-name proj)))))))
+      (dolist (buf opened)
+        (when (buffer-live-p buf)
+          (kill-buffer buf)))
+      (ignore-errors (delete-directory proj t)))))
+
 (ert-deftest agent-pane-sessions-delete-keybinding-present ()
   (should (eq (lookup-key agent-pane-sessions-mode-map (kbd "C-k"))
-              #'agent-pane-sessions-delete-at-point)))
+              #'agent-pane-sessions-delete-at-point))
+  (should (eq (lookup-key agent-pane-sessions-mode-map (kbd "a"))
+              #'agent-pane-sessions-add-project))
+  (should (eq (lookup-key agent-pane-sessions-mode-map (kbd "C-c v"))
+              #'agent-pane-toggle-header-details-anywhere))
+  (should (eq (lookup-key agent-pane-sessions-mode-map (kbd "C-c C-v"))
+              #'agent-pane-toggle-header-details-anywhere))
+  (should (eq (lookup-key agent-pane-sessions-mode-map (kbd "C-c d"))
+              #'agent-pane-view-diff-at-point-anywhere))
+  (should (eq (lookup-key agent-pane-sessions-mode-map (kbd "C-c C-d"))
+              #'agent-pane-view-diff-at-point-anywhere)))
 
 (provide 'agent-pane-sessions-tests)
 ;;; agent-pane-sessions-tests.el ends here
