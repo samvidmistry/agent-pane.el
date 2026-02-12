@@ -8,7 +8,6 @@ For what’s already implemented, see `docs/plan.md`.
 
 - Codex auth UX:
   - Detect when `codex-acp` is not authenticated and guide the user through login.
-  - Surface ACP `authenticate` failures with actionable next steps.
   - Support multiple auth methods (login vs `OPENAI_API_KEY` vs `CODEX_API_KEY`) and per-project configuration.
 - Credential handling:
   - Never log secrets in buffers or transcripts.
@@ -16,28 +15,20 @@ For what’s already implemented, see `docs/plan.md`.
 
 ## UX / UI
 
-- Sidebar improvements:
-  - search/filter
-  - sorting (by recency/title)
-  - rename session titles (write back to transcript header)
-  - preview snippet on the session line
-- Transcript replay:
-  - load a transcript into the chat buffer (read-only replay or a “continue chat from here”).
-- Keyboard navigation:
-  - jump between blocks
-  - fold/unfold message bodies
-  - copy code blocks / copy last tool output
-- Input editor:
-  - multiline input (dedicated edit buffer)
-  - history
-  - edit-and-resend
+- Transcript replay follow-up:
+  - "continue chat from here" semantics after replaying a past transcript.
+- Sidebar follow-ups:
+  - optional alternate grouping/sorting modes (for very large transcript sets).
+- Input UX follow-ups:
+  - richer dedicated editor features (e.g., mode hooks, draft persistence)
+  - improved history discoverability/UX in header/help
 
 ## Agent / Protocol
 
-- Permission UI for `session/request_permission`:
-  - present choices
-  - support “always allow” policies scoped by project/session/tool kind
-  - show pending requests in the UI
+- Permission UI follow-ups for `session/request_permission`:
+  - richer pending-request presentation in UI blocks
+  - management commands for stored allow rules (inspect/remove)
+  - finer policy scope controls beyond current project/session tool-key rules
 - Better tool-call visualization:
   - structured rendering of command/args
   - clickable file/line locations when provided

@@ -11,6 +11,12 @@
     (should (markerp agent-pane--input-marker))
     (should (<= (marker-position agent-pane--input-marker) (point-max)))))
 
+(ert-deftest agent-pane-mode-enables-visual-line-mode ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (should visual-line-mode)
+    (should-not truncate-lines)))
+
 (ert-deftest agent-pane-submit-appends-messages ()
   (with-temp-buffer
     (agent-pane-mode)
@@ -22,12 +28,120 @@
       ;; only adds the user message.
       (should (= (length msgs) 1))
       (should (eq (map-elt (nth 0 msgs) :role) 'user))
-      (should (equal (map-elt (nth 0 msgs) :text) "hello")))))
+      (should (equal (map-elt (nth 0 msgs) :text) "hello"))
+      (should (equal (map-elt agent-pane--state :input-history) '("hello"))))))
+
+(ert-deftest agent-pane-input-history-prev-next-roundtrip ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (goto-char (point-max))
+    (insert "first")
+    (agent-pane-submit)
+    (goto-char (point-max))
+    (insert "second")
+    (agent-pane-submit)
+    (goto-char (point-max))
+    (insert "draft")
+    (agent-pane-input-history-prev)
+    (should (equal (agent-pane--input-text) "second"))
+    (agent-pane-input-history-prev)
+    (should (equal (agent-pane--input-text) "first"))
+    (agent-pane-input-history-next)
+    (should (equal (agent-pane--input-text) "second"))
+    (agent-pane-input-history-next)
+    (should (equal (agent-pane--input-text) "draft"))))
+
+(ert-deftest agent-pane-copy-last-user-to-input-works ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (goto-char (point-max))
+    (insert "first")
+    (agent-pane-submit)
+    (goto-char (point-max))
+    (insert "second")
+    (agent-pane-submit)
+    (agent-pane-copy-last-user-to-input)
+    (should (equal (agent-pane--input-text) "second"))))
+
+(ert-deftest agent-pane-edit-input-commit-updates-chat-input ()
+  (let ((agent-pane-input-editor-buffer-name "*agent-pane input test*"))
+    (unwind-protect
+        (with-temp-buffer
+          (agent-pane-mode)
+          (goto-char (point-max))
+          (insert "hello")
+          (cl-letf (((symbol-function 'pop-to-buffer)
+                     (lambda (&rest _args) nil)))
+            (agent-pane-edit-input))
+          (with-current-buffer agent-pane-input-editor-buffer-name
+            (goto-char (point-max))
+            (insert "\nworld")
+            (cl-letf (((symbol-function 'pop-to-buffer)
+                       (lambda (&rest _args) nil)))
+              (agent-pane-input-editor-commit)))
+          (should (equal (agent-pane--input-text) "hello\nworld")))
+      (ignore-errors (kill-buffer "*agent-pane input test*")))))
+
+(ert-deftest agent-pane-jump-next-previous-message-works ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'user :text "one")
+    (agent-pane--append-message* :role 'assistant :text "two")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (agent-pane-jump-next-message)
+    (should (eq (map-elt (get-text-property (point) 'agent-pane-message) :role) 'user))
+    (agent-pane-jump-next-message)
+    (should (eq (map-elt (get-text-property (point) 'agent-pane-message) :role) 'assistant))
+    (agent-pane-jump-previous-message)
+    (should (eq (map-elt (get-text-property (point) 'agent-pane-message) :role) 'user))))
+
+(ert-deftest agent-pane-copy-last-tool-output-copies-output-section ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'tool
+                                 :text "id: tc1\nstatus: completed\n\noutput:\nok")
+    (let (copied)
+      (cl-letf (((symbol-function 'kill-new)
+                 (lambda (s &optional _replace)
+                   (setq copied s))))
+        (agent-pane-copy-last-tool-output)
+        (should (equal copied "ok"))))))
+
+(ert-deftest agent-pane-copy-code-block-at-point-copies-body ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'assistant
+                                 :text "```elisp\n(+ 1 2)\n```")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (should (search-forward "(+ 1 2)" nil t))
+    (let (copied)
+      (cl-letf (((symbol-function 'kill-new)
+                 (lambda (s &optional _replace)
+                   (setq copied s))))
+        (agent-pane-copy-code-block-at-point)
+        (should (equal copied "(+ 1 2)"))))))
+
+(ert-deftest agent-pane-toggle-fold-message-at-point-toggles-overlay ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'assistant :text "line 1\nline 2")
+    (agent-pane--rerender)
+    (agent-pane-jump-next-message)
+    (let ((msg (get-text-property (point) 'agent-pane-message)))
+      (agent-pane-toggle-fold-message-at-point)
+      (let ((ov (gethash msg agent-pane--fold-overlays)))
+        (should (overlayp ov))
+        (should (eq (overlay-get ov 'invisible) 'agent-pane-fold)))
+      (agent-pane-toggle-fold-message-at-point)
+      (should-not (gethash msg agent-pane--fold-overlays)))))
 
 (ert-deftest agent-pane-ensure-acp-client-applies-config-overrides ()
   (with-temp-buffer
     (agent-pane-mode)
     (let ((agent-pane-acp-client-maker nil)
+          (agent-pane-acp-provider 'codex)
           (agent-pane-codex-command '("codex-acp" "--flag"))
           (agent-pane-codex-config-overrides '("model_reasoning_effort=\"high\""
                                                "sandbox_mode=\"danger-full-access\"")))
@@ -40,6 +154,236 @@
                          "-c" "model_reasoning_effort=\"high\""
                          "-c" "sandbox_mode=\"danger-full-access\"")))))))
 
+(ert-deftest agent-pane-acp-command-and-params-supports-copilot-provider ()
+  (let ((agent-pane-acp-provider 'copilot)
+        (agent-pane-copilot-command '("copilot" "--acp" "--foo"))
+        (agent-pane-codex-config-overrides '("ignored=\"1\"")))
+    (should (equal (agent-pane--acp-command-and-params)
+                   '("copilot" "--acp" "--foo")))))
+
+(ert-deftest agent-pane-acp-command-and-params-supports-claude-provider ()
+  (let ((agent-pane-acp-provider 'claude-code)
+        (agent-pane-claude-code-command '("claude-code-acp" "--bar"))
+        (agent-pane-codex-config-overrides '("ignored=\"1\"")))
+    (should (equal (agent-pane--acp-command-and-params)
+                   '("claude-code-acp" "--bar")))))
+
+(ert-deftest agent-pane-acp-environment-follows-provider ()
+  (let ((agent-pane-codex-environment '("A=1"))
+        (agent-pane-copilot-environment '("B=2"))
+        (agent-pane-claude-code-environment '("C=3")))
+    (let ((agent-pane-acp-provider 'codex))
+      (should (equal (agent-pane--acp-environment) '("A=1"))))
+    (let ((agent-pane-acp-provider 'copilot))
+      (should (equal (agent-pane--acp-environment) '("B=2"))))
+    (let ((agent-pane-acp-provider 'claude-code))
+      (should (equal (agent-pane--acp-environment) '("C=3"))))))
+
+(ert-deftest agent-pane-set-acp-provider-resets-connection-state ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (map-put! agent-pane--state :client '((dummy . t)))
+    (map-put! agent-pane--state :session-id "s1")
+    (map-put! agent-pane--state :subscribed t)
+    (let ((agent-pane-acp-provider 'codex)
+          (agent-pane-auth-method-id "chatgpt"))
+      (agent-pane-set-acp-provider 'copilot)
+      (should (eq agent-pane-acp-provider 'copilot))
+      (should (null agent-pane-auth-method-id))
+      (should (null (map-elt agent-pane--state :client)))
+      (should (null (map-elt agent-pane--state :session-id)))
+      (should (null (map-elt agent-pane--state :subscribed))))))
+
+(ert-deftest agent-pane-set-session-model-updates-active-session ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (map-put! agent-pane--state :client (list (cons :agent-pane-fake t)))
+    (map-put! agent-pane--state :session-id "s1")
+    (let (sent-request)
+      (cl-letf (((symbol-function 'agent-pane--acp-send-request)
+                 (lambda (&rest args)
+                   (setq sent-request (plist-get args :request))
+                   (funcall (plist-get args :on-success) '((ok . t))))))
+        (agent-pane-set-session-model "gpt-5")
+        (should (equal agent-pane-session-model-id "gpt-5"))
+        (should (equal (map-elt sent-request :method) "session/set_model"))
+        (should (equal (or (map-nested-elt sent-request '(params modelId))
+                           (map-nested-elt sent-request '(:params modelId)))
+                       "gpt-5"))))))
+
+(ert-deftest agent-pane-set-session-model-clears-preference ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (let ((agent-pane-session-model-id "gpt-5"))
+      (agent-pane-set-session-model "")
+      (should (null agent-pane-session-model-id)))))
+
+(ert-deftest agent-pane-extract-diff-info-supports-standard-content ()
+  (let* ((tool-call '((content . ((type . "diff")
+                                  (path . "src/main.el")
+                                  (oldText . "a\nb\n")
+                                  (newText . "a\nc\n")))))
+         (diff (agent-pane--extract-diff-info tool-call)))
+    (should (equal (plist-get diff :file) "src/main.el"))
+    (should (equal (plist-get diff :old) "a\nb\n"))
+    (should (equal (plist-get diff :new) "a\nc\n"))))
+
+(ert-deftest agent-pane-tool-call-content-string-skips-diff-items ()
+  (let* ((content [((type . "diff")
+                    (path . "src/main.el")
+                    (oldText . "old")
+                    (newText . "new"))
+                   ((type . "text")
+                    (content . ((text . "hello"))))])
+         (s (agent-pane--tool-call-content->string content)))
+    (should (equal s "hello"))))
+
+(ert-deftest agent-pane-view-diff-at-point-opens-tool-diff ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (let* ((tool-id "tc_1")
+           (diff '(:file "src/main.el" :old "a\n" :new "a\nb\n"))
+           (idx (agent-pane--append-message* :role 'tool :title "bash" :text "changes pending"))
+           shown)
+      (puthash tool-id idx (map-elt agent-pane--state :tool-call-msg-index))
+      (puthash tool-id (list :toolCallId tool-id :diff diff) (map-elt agent-pane--state :tool-calls))
+      (agent-pane--rerender)
+      (agent-pane-jump-next-message)
+      (cl-letf (((symbol-function 'agent-pane--show-diff)
+                 (lambda (d &optional _title)
+                   (setq shown d))))
+        (agent-pane-view-diff-at-point)
+        (should (equal shown diff))))))
+
+(ert-deftest agent-pane-tool-call-entry-to-text-shows-last-five-lines ()
+  (let* ((agent-pane-tool-output-preview-lines 5)
+         (entry (list :title "bash"
+                      :command "echo hello"
+                      :output (string-join '("l1" "l2" "l3" "l4" "l5" "l6" "l7") "\n")))
+         (text (agent-pane--tool-call-entry-to-text entry)))
+    (should (string-match-p "^tool: bash echo hello" text))
+    (should (string-match-p "output (latest 5 lines, 2 omitted):" text))
+    (should-not (string-match-p "l1" text))
+    (should (string-match-p "l3" text))
+    (should (string-match-p "l7" text))))
+
+(ert-deftest agent-pane-tool-call-entry-to-text-shows-full-output-when-toggled ()
+  (let* ((agent-pane--tool-output-full-mode t)
+         (entry (list :title "bash"
+                      :command "echo hello"
+                      :output (string-join '("l1" "l2" "l3") "\n")))
+         (text (agent-pane--tool-call-entry-to-text entry)))
+    (should (string-match-p "output (full):" text))
+    (should (string-match-p "l1" text))
+    (should (string-match-p "l3" text))
+    (should-not (string-match-p "latest" text))))
+
+(ert-deftest agent-pane-toggle-tool-output-mode-refreshes-tool-messages ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (let* ((tool-id "tc_1")
+           (idx (agent-pane--append-message* :role 'tool :title "bash" :text "placeholder"))
+           (entry (list :toolCallId tool-id
+                        :title "bash"
+                        :command "echo hello"
+                        :output (string-join '("l1" "l2" "l3" "l4" "l5" "l6") "\n"))))
+      (puthash tool-id idx (map-elt agent-pane--state :tool-call-msg-index))
+      (puthash tool-id entry (map-elt agent-pane--state :tool-calls))
+      (agent-pane--refresh-tool-call-messages)
+      (agent-pane--rerender)
+      (should-not agent-pane--tool-output-full-mode)
+      (should (string-match-p "output (latest" (buffer-string)))
+      (agent-pane-toggle-tool-output-mode)
+      (should agent-pane--tool-output-full-mode)
+      (should (string-match-p "output (full):" (buffer-string)))
+      (agent-pane-toggle-tool-output-mode)
+      (should-not agent-pane--tool-output-full-mode)
+      (should (string-match-p "output (latest" (buffer-string))))))
+
+(ert-deftest agent-pane-tool-message-has-invocation-and-output-faces ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'tool
+                                 :title "bash"
+                                 :text "tool: bash echo hi\n\noutput (latest 5 lines):\nok")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (search-forward "tool: bash")
+    (let ((line-beg (line-beginning-position)))
+      (should (eq (get-text-property line-beg 'face)
+                  'agent-pane-tool-invocation-block)))
+    (search-forward "output (latest 5 lines):")
+    (let ((line-beg (line-beginning-position)))
+      (should (eq (get-text-property line-beg 'face)
+                  'agent-pane-tool-output-block)))))
+
+(ert-deftest agent-pane-exit-keybindings-present ()
+  (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-q"))
+              #'agent-pane-exit))
+  (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-v"))
+              #'agent-pane-toggle-header-details))
+  (should (eq (lookup-key agent-pane-mode-map (kbd "C-c v"))
+              #'agent-pane-toggle-header-details))
+  (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-m"))
+              #'agent-pane-set-session-model))
+  (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-d"))
+              #'agent-pane-view-diff-at-point))
+  (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-o"))
+              #'agent-pane-toggle-tool-output-mode))
+  (should (eq (lookup-key agent-pane-mode-map (kbd "C-c C-i"))
+              #'agent-pane-edit-input))
+  (should (eq (lookup-key agent-pane-sessions-mode-map (kbd "q"))
+              #'agent-pane-exit)))
+
+(ert-deftest agent-pane-header-summary-is-compact-when-collapsed ()
+  (let ((agent-pane-show-acp-header t)
+        (agent-pane-header-details-collapsed t)
+        (agent-pane-acp-provider 'copilot)
+        (agent-pane-session-model-id "gpt-5"))
+    (with-temp-buffer
+      (agent-pane-mode)
+      (agent-pane--rerender)
+      (let ((s (buffer-string)))
+        (should (string-match-p "provider=copilot" s))
+        (should (string-match-p "model=gpt-5" s))
+        (should-not (string-match-p "authMethods:" s))))))
+
+(ert-deftest agent-pane-toggle-header-details-expands-debug-section ()
+  (let ((agent-pane-show-acp-header t)
+        (agent-pane-header-details-collapsed t))
+    (with-temp-buffer
+      (agent-pane-mode)
+      (map-put! agent-pane--state :init-result '((protocolVersion . 1)
+                                                 (agentCapabilities . ((loadSession . t)
+                                                                       (promptCapabilities . ((image . t)))))))
+      (agent-pane--rerender)
+      (should-not (string-match-p "Server: protocolVersion=" (buffer-string)))
+      (agent-pane-toggle-header-details)
+      (should (string-match-p "Server: protocolVersion=" (buffer-string))))))
+
+(ert-deftest agent-pane-exit-closes-app-buffers ()
+  (let* ((chat (get-buffer-create agent-pane-buffer-name))
+         (sessions (get-buffer-create agent-pane-sessions-buffer-name))
+         (input (get-buffer-create agent-pane-input-editor-buffer-name))
+         (client '((dummy . t)))
+         shutdown-client)
+    (unwind-protect
+        (progn
+          (with-current-buffer chat
+            (agent-pane-mode)
+            (map-put! agent-pane--state :client client))
+          (cl-letf (((symbol-function 'acp-shutdown)
+                     (lambda (&key client)
+                       (setq shutdown-client client))))
+            (agent-pane-exit))
+          (should (equal shutdown-client client))
+          (should-not (buffer-live-p chat))
+          (should-not (buffer-live-p sessions))
+          (should-not (buffer-live-p input)))
+      (ignore-errors (kill-buffer chat))
+      (ignore-errors (kill-buffer sessions))
+      (ignore-errors (kill-buffer input)))))
+
 (ert-deftest agent-pane-ui-status-line-shows-waiting ()
   (with-temp-buffer
     (agent-pane-mode)
@@ -49,6 +393,7 @@
            (end (marker-position agent-pane--status-end-marker))
            (s (buffer-substring-no-properties start end)))
       (should (string-match-p "waiting for agent" s))
+      (should (eq (get-text-property start 'face) 'agent-pane-status-busy))
       (should (string-match-p "waiting for agent" (format "%s" header-line-format))))))
 
 (ert-deftest agent-pane-prompt-queue-sends-followups-in-order ()
@@ -131,6 +476,28 @@
                 (should (string-match-p "## User" (buffer-string)))))))
       (ignore-errors (delete-directory dir t)))))
 
+(ert-deftest agent-pane-transcript-title-refreshes-sessions-sidebar ()
+  (let ((agent-pane-save-transcripts 'always)
+        (dir (make-temp-file "agent-pane-transcripts" t))
+        (refresh-count 0))
+    (unwind-protect
+        (let ((agent-pane-transcript-directory dir))
+          (cl-letf (((symbol-function 'agent-pane-sessions-refresh-if-visible)
+                     (lambda ()
+                       (setq refresh-count (1+ refresh-count)))))
+            (with-temp-buffer
+              (agent-pane-mode)
+              (goto-char (point-max))
+              (insert "Dynamic session title from first message")
+              (agent-pane-submit)
+              (let ((file (map-elt agent-pane--state :transcript-file)))
+                (with-temp-buffer
+                  (insert-file-contents file)
+                  (should (string-match-p "- title: Dynamic session title from first message"
+                                          (buffer-string)))))))
+          (should (>= refresh-count 2)))
+      (ignore-errors (delete-directory dir t)))))
+
 (ert-deftest agent-pane-markdown-assistant-strong-is-colored ()
   (with-temp-buffer
     (agent-pane-mode)
@@ -182,6 +549,75 @@
     (re-search-forward "\\*\\*Bold\\*\\*" nil t)
     (should (eq (get-text-property (match-beginning 0) 'invisible)
                 'agent-pane-markup))))
+
+(ert-deftest agent-pane-markdown-heading-is-fontified ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'assistant :text "# Heading")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (should (re-search-forward "# Heading" nil t))
+    (let ((beg (match-beginning 0)))
+      (should (eq (get-text-property beg 'face) 'agent-pane-markdown-delimiter))
+      (should (eq (get-text-property (+ beg 2) 'face) 'agent-pane-markdown-heading)))))
+
+(ert-deftest agent-pane-markdown-list-marker-is-fontified ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'assistant :text "- item")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (should (re-search-forward "- item" nil t))
+    (let ((beg (match-beginning 0)))
+      (should (eq (get-text-property beg 'face) 'agent-pane-markdown-list-marker)))))
+
+(ert-deftest agent-pane-markdown-link-is-fontified ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'assistant :text "[label](https://example.com)")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (should (re-search-forward "\\[label\\](https://example.com)" nil t))
+    (let ((beg (match-beginning 0)))
+      (should (eq (get-text-property beg 'face) 'agent-pane-markdown-delimiter))
+      (should (eq (get-text-property (1+ beg) 'face) 'agent-pane-markdown-link-label))
+      (should (eq (get-text-property beg 'invisible) 'agent-pane-markup)))))
+
+(ert-deftest agent-pane-markdown-table-is-aligned-with-display-text ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message*
+     :role 'assistant
+     :text (string-join '("| Name | Score |"
+                          "| --- | ---: |"
+                          "| Al | 10 |"
+                          "| Beatrice | 200 |")
+                        "\n"))
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (search-forward "Name")
+    (let* ((line1 (line-beginning-position))
+           (d1 (get-text-property line1 'display)))
+      (forward-line 2)
+      (let* ((line3 (line-beginning-position))
+             (d3 (get-text-property line3 'display)))
+        (should (stringp d1))
+        (should (stringp d3))
+        (should (string-match-p "| Al       |" d3))
+        (should (= (string-width d1) (string-width d3)))))))
+
+(ert-deftest agent-pane-markdown-table-has-table-face ()
+  (with-temp-buffer
+    (agent-pane-mode)
+    (agent-pane--append-message* :role 'assistant
+                                 :text "| A | B |\n| --- | --- |\n| 1 | 2 |")
+    (agent-pane--rerender)
+    (goto-char (point-min))
+    (search-forward "| A | B |")
+    (beginning-of-line)
+    (let ((lbeg (point)))
+      (should (eq (get-text-property lbeg 'face)
+                  'agent-pane-markdown-table)))))
 
 (provide 'agent-pane-tests)
 ;;; agent-pane-tests.el ends here

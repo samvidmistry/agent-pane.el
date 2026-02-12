@@ -65,14 +65,16 @@ All chats can be persisted as Markdown transcripts:
 - per-session transcript files in `agent-pane-transcript-directory`
 - header metadata includes:
   - `project_root` (from `project.el`)
-  - `created`, `buffer`, `codex_command`, `session_mode`, etc.
+  - `created`, `buffer`, `acp_provider`, `acp_command`, `session_mode`, etc.
   - `acp_session_id` logged once when available
   - `title` derived from the first user turn
 
 ## Phase 2: ACP Wiring (done; minimal surface but functional)
 
 - ACP client lifecycle:
-  - `initialize` → `authenticate` → `session/new` → `session/set_mode`
+  - `initialize` → optional `authenticate` → `session/new` → optional `session/set_mode` → optional `session/set_model`
+- Provider profiles:
+  - Codex (`codex-acp`), GitHub Copilot CLI (`copilot --acp`), and Claude Code (`claude-code-acp`).
 - Prompt sending:
   - `session/prompt` + streaming notifications
 - Streaming coverage:
@@ -99,11 +101,35 @@ Done:
   - `agent-pane` defaults to app layout when `agent-pane-use-sidebar` is non-nil
 - Debug/inspection commands:
   - open traffic/logs/stderr, show internal state, show raw payload at point
+- Transcript replay in chat view:
+  - sessions sidebar `RET` loads transcript messages into `agent-pane`
+  - when transcript metadata has `acp_session_id` and server supports `loadSession`, handshake requests true ACP session resume
+  - sessions sidebar `o` opens the raw `.md` transcript file
+- Sidebar UX improvements:
+  - filter (`/`) + clear (`c`)
+  - sorting toggle (`s`: recency/title)
+  - rename transcript title (`r`, writes back header)
+  - delete transcript at point with confirmation (`C-k`)
+  - optional preview snippet on session lines
+- Permission UI baseline:
+  - new `agent-pane-permission-policy` mode: `prompt`
+  - explicit choice prompt for `session/request_permission`
+  - “always allow” persistence for session scope and project scope
+- Input UX baseline:
+  - multiline input editor (`C-c C-i`)
+  - input history (`M-p` / `M-n`)
+  - edit-and-resend helper (`C-c C-y` copies last user prompt into input)
+- Tool output UX:
+  - toggle output preview/full mode (`C-c C-o`)
+- Richer markdown handling:
+  - headings, list markers, and links in addition to strong/code/fences
+- Keyboard navigation baseline:
+  - jump to previous/next transcript message block (`C-c C-p` / `C-c C-n`)
+  - fold/unfold message body at point (`C-c C-f`)
+  - copy last tool output helper (`C-c C-w`)
+  - copy fenced code block body at point (`C-c C-b`)
+  - open structured tool/file-change diff at point (`C-c C-d`, `diff-mode`/`ediff`)
 
 Next:
 
-- Sidebar UX: search/filter, sorting toggles, rename session title.
-- “Open transcript in chat view” (replay) rather than only opening the `.md` file.
-- Permissions UI (explicit choices + “always allow” persistence).
-- Richer Markdown handling (headings/lists/links) without compromising streaming performance.
-- Input improvements (multiline editor, history, edit-and-resend).
+- Phase 3 baseline is complete; continue with backlog hardening items.

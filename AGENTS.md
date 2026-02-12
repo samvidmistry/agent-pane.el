@@ -36,6 +36,9 @@ All commands below assume repo root.
 - Run tests (ERT, batch):
   - `./scripts/test.sh`
   - From PowerShell: `.\scripts\test.ps1`
+- Replay ACP traffic and snapshot rendered UI text (headless):
+  - `./scripts/ui-replay.sh`
+  - From PowerShell: `.\scripts\ui-replay.ps1`
 - Byte-compile project:
   - `./scripts/byte-compile.sh`
   - From PowerShell: `.\scripts\byte-compile.ps1`
@@ -97,19 +100,44 @@ For every new feature or code change:
   - Perform a documented dry run (step-by-step, reproducible commands) when the behavior is inherently interactive.
 - If you cannot properly test a change with existing tools, first build the tooling needed to test it well.
   - Example: add deterministic fakes, traffic capture/replay, or batch-mode scripts so the agent can validate changes autonomously.
+- For sessions/sidebar UX changes (`lisp/agent-pane-sessions.el`), add/extend ERTs in
+  `test/agent-pane-sessions-tests.el` for:
+  - filtering/sorting behavior,
+  - transcript replay loading,
+  - title rename persistence in transcript headers.
+- For input and keyboard UX changes (`agent-pane.el` input/history/jump/copy helpers),
+  add/extend tests in `test/agent-pane-tests.el` covering history traversal,
+  editor commit, and message navigation/copy helpers.
+- For permission-flow changes (`session/request_permission`), add/extend tests in
+  `test/agent-pane-acp-tests.el` for:
+  - noninteractive safety,
+  - prompt decision paths,
+  - session/project rule persistence.
+- For rendering/state-flow changes, run both:
+  - `./scripts/test.sh`
+  - `./scripts/ui-replay.sh`
 
 ## ACP Integration (Current)
 
-- `agent-pane` will attempt to connect to Codex via ACP on submit when:
+- `agent-pane` will attempt to connect to the selected ACP provider on submit when:
   - `agent-pane-enable-acp` is non-nil, and
   - Emacs is interactive (`noninteractive` is nil).
-- It spawns the ACP server configured by `agent-pane-codex-command` (default: `("codex-acp")`).
-- It also appends `agent-pane-codex-config-overrides` as `codex-acp -c ...` flags.
-  - Defaults are set to request `model_reasoning_effort="high"` and `sandbox_mode="danger-full-access"`.
+- Provider profile is selected via `agent-pane-acp-provider`:
+  - `codex` → `agent-pane-codex-command` (default `("codex-acp")`)
+  - `copilot` → `agent-pane-copilot-command` (default `("copilot" "--acp")`)
+  - `claude-code` → `agent-pane-claude-code-command` (default `("claude-code-acp")`)
+  - `custom` → manual command via `agent-pane-codex-command`
+- Codex-only overrides (`agent-pane-codex-config-overrides`) are appended as
+  `codex-acp -c ...` flags when provider is `codex`.
 - Current protocol coverage is intentionally minimal:
   - Streams `"session/update"` → `"agent_message_chunk"` into the active assistant message.
+  - Authentication request is sent only when `agent-pane-auth-method-id` is non-nil.
   - After `session/new`, sends `session/set_mode` using `agent-pane-session-mode-id` (default: `"bypassPermissions"`).
-  - Handles `"session/request_permission"` according to `agent-pane-permission-policy` (default: auto-allow).
+  - Handles `"session/request_permission"` according to `agent-pane-permission-policy`.
+    - `auto-allow` / `auto-cancel` are non-interactive policies.
+    - `prompt` asks for explicit choice and can persist allow rules by tool-key
+      for session scope and project scope (project rules stored in
+      `agent-pane-permission-rules-file`).
 
 ## ACP Testing
 

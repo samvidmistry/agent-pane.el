@@ -23,6 +23,9 @@ Traffic files:
 Tests:
 
 - `test/agent-pane-acp-tests.el`
+  - handshake + prompt streaming via traffic replay
+  - interleaved thought/tool/assistant rendering behavior
+  - permission decision flows (`auto-allow`, prompt mode, session/project rule persistence)
 
 ## Adding / Updating Traffic
 
@@ -35,3 +38,10 @@ High-level approach:
 3. Drop the file into `test/traffic/` and adjust tests to replay it.
 
 This keeps integration tests accurate while remaining offline/replayable.
+
+## Inspecting rendered UI output from replay
+
+For a deterministic, headless UI snapshot (without interactive Emacs), see
+`docs/testing-ui.md` and run:
+
+- `./scripts/ui-replay.sh`
