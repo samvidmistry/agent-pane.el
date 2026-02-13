@@ -30,6 +30,7 @@
 (declare-function agent-pane--acp-command-and-params "agent-pane-util")
 (declare-function agent-pane--acp-environment "agent-pane-util")
 (declare-function agent-pane--set-message-queued "agent-pane-state")
+(declare-function agent-pane--update-usage-metrics "agent-pane-ui")
 (defvar agent-pane--permission-project-rules-cache :uninitialized
   "Cached project permission rules loaded from `agent-pane-permission-rules-file'.")
 (defun agent-pane--append-acp-event (text &optional raw)
@@ -800,6 +801,10 @@ Return a cons cell (IDX . CREATEDP)."
               (agent-pane--transcript-role-heading 'user "server")
               (agent-pane--transcript-log-session-id)
               (agent-pane--transcript-append (concat text "\n\n")))))
+         ;; Usage/cost updates.
+         ((equal kind "usage_update")
+          (when (agent-pane--update-usage-metrics update)
+            (agent-pane--ui-update-status-line)))
          ;; Tool calls.
          ((equal kind "tool_call")
           (when agent-pane-show-tool-calls
@@ -1505,10 +1510,11 @@ used to clear queued UI state once the prompt starts."
                    :prompt (list `((type . "text")
                                    (text . ,(substring-no-properties text)))))
          :on-success (lambda (resp)
-                       (map-put! agent-pane--state :last-prompt-result resp)
-                       (if (map-elt resp 'stopReason)
-                           (progn
-                             (map-put! agent-pane--state :prompt-in-flight nil)
+                        (map-put! agent-pane--state :last-prompt-result resp)
+                        (agent-pane--update-usage-metrics resp)
+                        (if (map-elt resp 'stopReason)
+                            (progn
+                              (map-put! agent-pane--state :prompt-in-flight nil)
                              (map-put! agent-pane--state :in-progress nil)
                              (let ((idx (map-elt agent-pane--state :streaming-assistant-index)))
                                (cond

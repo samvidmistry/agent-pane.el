@@ -122,12 +122,233 @@ typing in the input area)."
   "Return current provider label for header summary/status text."
   (format "%s" (or agent-pane-acp-provider 'codex)))
 
+(defconst agent-pane--default-context-size 200000
+  "Fallback model context window size used for local estimation.")
+
+(defconst agent-pane--known-model-context-sizes
+  '(("claude-sonnet-4.5" . 200000)
+    ("claude-opus-4.6-1m" . 1000000)
+    ("gpt-5-mini" . 128000))
+  "Known model context window sizes keyed by normalized model id.")
+
+(defun agent-pane--usage-get (obj keys)
+  "Return first mapped value from OBJ for KEYS, or nil."
+  (catch 'found
+    (dolist (key keys)
+      (condition-case nil
+          (when (map-contains-key obj key)
+            (throw 'found (map-elt obj key)))
+        (error nil)))
+    nil))
+
+(defun agent-pane--normalize-nonnegative-integer (value)
+  "Return VALUE as a non-negative integer, or nil."
+  (when (and (numberp value)
+             (>= value 0)
+             (= value (truncate value)))
+    (truncate value)))
+
+(defun agent-pane--normalize-utilization-ratio (value)
+  "Normalize utilization VALUE to a ratio in the range 0..1."
+  (when (numberp value)
+    (cond
+     ((and (>= value 0.0) (<= value 1.0))
+      value)
+     ((and (> value 1.0) (<= value 100.0))
+      (/ value 100.0))
+     (t nil))))
+
+(defun agent-pane--extract-usage-metrics (payload)
+  "Extract usage metrics plist from ACP PAYLOAD, or nil when absent."
+  (let* ((usage (agent-pane--usage-get payload '(usage)))
+         (context-window (or (agent-pane--usage-get payload '(contextWindow context_window))
+                             (agent-pane--usage-get usage '(contextWindow context_window))))
+         (context-used
+          (agent-pane--normalize-nonnegative-integer
+           (or (agent-pane--usage-get context-window '(usedTokens used_tokens used))
+               (agent-pane--usage-get payload '(used usedTokens used_tokens)))))
+         (context-max
+          (agent-pane--normalize-nonnegative-integer
+           (or (agent-pane--usage-get context-window '(maxTokens max_tokens size max))
+               (agent-pane--usage-get payload '(size maxTokens max_tokens max)))))
+         (utilization
+          (agent-pane--normalize-utilization-ratio
+           (or (agent-pane--usage-get context-window '(utilization))
+               (agent-pane--usage-get payload '(utilization)))))
+         (input-tokens
+          (agent-pane--normalize-nonnegative-integer
+           (or (agent-pane--usage-get usage '(input_tokens inputTokens))
+               (agent-pane--usage-get payload '(input_tokens inputTokens)))))
+         (output-tokens
+          (agent-pane--normalize-nonnegative-integer
+           (or (agent-pane--usage-get usage '(output_tokens outputTokens))
+               (agent-pane--usage-get payload '(output_tokens outputTokens)))))
+         (total-tokens
+          (agent-pane--normalize-nonnegative-integer
+           (or (agent-pane--usage-get usage '(total_tokens totalTokens))
+               (agent-pane--usage-get payload '(total_tokens totalTokens)))))
+         (cost-map (or (agent-pane--usage-get payload '(cost))
+                       (agent-pane--usage-get usage '(cost))))
+         (cost-usd (agent-pane--usage-get payload '(costUsd cost_usd)))
+         (cost (cond
+                ((numberp cost-usd) cost-usd)
+                ((numberp (agent-pane--usage-get cost-map '(amount)))
+                 (agent-pane--usage-get cost-map '(amount)))
+                (t nil)))
+         (cost-currency (or (agent-pane--usage-get cost-map '(currency))
+                            (and (numberp cost-usd) "USD")))
+         metrics)
+    (when (numberp context-used)
+      (setq metrics (plist-put metrics :context-used context-used)))
+    (when (numberp context-max)
+      (setq metrics (plist-put metrics :context-max context-max)))
+    (when (numberp utilization)
+      (setq metrics (plist-put metrics :context-utilization utilization)))
+    (when (numberp input-tokens)
+      (setq metrics (plist-put metrics :input-tokens input-tokens)))
+    (when (numberp output-tokens)
+      (setq metrics (plist-put metrics :output-tokens output-tokens)))
+    (when (numberp total-tokens)
+      (setq metrics (plist-put metrics :total-tokens total-tokens)))
+    (when (numberp cost)
+      (setq metrics (plist-put metrics :cost cost))
+      (when (stringp cost-currency)
+        (setq metrics (plist-put metrics :cost-currency cost-currency))))
+    metrics))
+
+(defun agent-pane--update-usage-metrics (payload)
+  "Merge usage metrics extracted from PAYLOAD into chat state.
+Return non-nil when metrics changed."
+  (agent-pane--ensure-state)
+  (let ((delta (agent-pane--extract-usage-metrics payload)))
+    (when delta
+      (let* ((current (copy-sequence (or (map-elt agent-pane--state :usage-metrics) nil)))
+             (next (copy-sequence current))
+             (delta-iter delta)
+             (context-changed (or (plist-member delta :context-used)
+                                  (plist-member delta :context-max))))
+        (while delta-iter
+          (setq next (plist-put next (car delta-iter) (cadr delta-iter)))
+          (setq delta-iter (cddr delta-iter)))
+        (when (and context-changed
+                   (not (plist-member delta :context-utilization)))
+          (let ((used (plist-get next :context-used))
+                (max (plist-get next :context-max)))
+            (when (and (numberp used) (numberp max) (> max 0))
+              (setq next (plist-put next :context-utilization
+                                    (/ (float used) (float max)))))))
+        (unless (equal current next)
+          (map-put! agent-pane--state :usage-metrics next)
+          t)))))
+
+(defun agent-pane--ui-format-cost (amount currency)
+  "Return display string for COST AMOUNT and CURRENCY."
+  (when (numberp amount)
+    (let* ((formatted (format "%.6f" amount))
+           (trimmed (replace-regexp-in-string "\\.?0+\\'" "" formatted))
+           (ccy (if (stringp currency) (upcase currency) "USD")))
+      (if (equal ccy "USD")
+          (format "$%s" trimmed)
+        (format "%s %s" trimmed ccy)))))
+
+(defun agent-pane--estimate-tokens (text)
+  "Estimate token count for TEXT using a rough chars-per-token heuristic."
+  (cond
+   ((null text) 0)
+   ((not (stringp text))
+    (agent-pane--estimate-tokens (format "%s" text)))
+   ((string-empty-p text) 1)
+   (t
+    (ceiling (/ (float (length text)) 4.0)))))
+
+(defun agent-pane--model-context-size (model-id)
+  "Return estimated context size for MODEL-ID."
+  (let ((id (and (stringp model-id) (downcase (string-trim model-id)))))
+    (cond
+     ((not (stringp id))
+      agent-pane--default-context-size)
+     ((cdr (assoc id agent-pane--known-model-context-sizes)))
+     ((string-match-p (rx (or string-start "-" "_")
+                          "1m"
+                          (or string-end "-" "_"))
+                      id)
+      1000000)
+     (t
+      agent-pane--default-context-size))))
+
+(defun agent-pane--estimate-context-usage ()
+  "Estimate context usage for the current chat from local message state."
+  (agent-pane--ensure-state)
+  (let ((used 0))
+    (dolist (msg (or (map-elt agent-pane--state :messages) nil))
+      (let ((text (map-elt msg :text)))
+        (when (and (stringp text) (not (string-empty-p text)))
+          (setq used (+ used (agent-pane--estimate-tokens text))))))
+    (let ((tool-table (map-elt agent-pane--state :tool-calls)))
+      (when (hash-table-p tool-table)
+        (maphash (lambda (_id entry)
+                   (let ((output (plist-get entry :output)))
+                     (when (and (stringp output) (not (string-empty-p output)))
+                       (setq used (+ used (agent-pane--estimate-tokens output))))))
+                 tool-table)))
+    (let* ((context-max (agent-pane--model-context-size
+                         (map-elt agent-pane--state :current-model-id)))
+           (utilization (and (> context-max 0)
+                             (/ (float used) (float context-max)))))
+      (list :context-used used
+            :context-max context-max
+            :context-utilization utilization))))
+
+(defun agent-pane--ui-usage-summary ()
+  "Return compact usage summary text, or nil when unavailable."
+  (let* ((server (map-elt agent-pane--state :usage-metrics))
+         (server-used (plist-get server :context-used))
+         (server-max (plist-get server :context-max))
+         (server-has-context (and (numberp server-used)
+                                  (numberp server-max)
+                                  (> server-max 0)))
+         (estimated (and agent-pane-estimate-context-usage
+                         (not server-has-context)
+                         (agent-pane--estimate-context-usage)))
+         (context-used (if server-has-context
+                           server-used
+                         (plist-get estimated :context-used)))
+         (context-max (if server-has-context
+                          server-max
+                        (plist-get estimated :context-max)))
+         (context-utilization
+          (or (and server-has-context
+                   (or (plist-get server :context-utilization)
+                       (/ (float server-used) (float server-max))))
+              (plist-get estimated :context-utilization)))
+         (estimated-context (and (not server-has-context) estimated))
+         (cost (plist-get server :cost))
+         (cost-currency (plist-get server :cost-currency))
+         parts)
+    (when (and (numberp context-used)
+               (numberp context-max)
+               (> context-max 0)
+               (numberp context-utilization))
+      (let ((pct (floor (* 100 context-utilization))))
+        (push (if estimated-context
+                  (format "ctx~=%d%% (~%d/%d)" pct context-used context-max)
+                (format "ctx=%d%% (%d/%d)" pct context-used context-max))
+              parts)))
+    (when-let ((cost-text (agent-pane--ui-format-cost cost cost-currency)))
+      (push (format "cost=%s" cost-text) parts))
+    (when parts
+      (string-join (nreverse parts) "  "))))
+
 (defun agent-pane--ui-header-line ()
   "Compute the header-line text with status and provider/model metadata."
-  (format "%s  provider=%s  model=%s"
-          (agent-pane--ui-status-line)
-          (agent-pane--header-provider-label)
-          (agent-pane--header-model-label)))
+  (let* ((base (format "%s  provider=%s  model=%s"
+                       (agent-pane--ui-status-line)
+                       (agent-pane--header-provider-label)
+                       (agent-pane--header-model-label)))
+         (usage (agent-pane--ui-usage-summary)))
+    (if usage
+        (format "%s  %s" base usage)
+      base)))
 
 (defun agent-pane--ui-status-face ()
   "Return the face symbol used for the current status line."

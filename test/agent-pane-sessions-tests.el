@@ -308,6 +308,58 @@
         (kill-buffer chat-buf))
       (ignore-errors (delete-directory dir t)))))
 
+(ert-deftest agent-pane-sessions-open-at-point-estimates-usage-from-replayed-messages ()
+  (let* ((dir (make-temp-file "agent-pane-transcripts" t))
+         (agent-pane-transcript-directory dir)
+         (f (expand-file-name "20260101-010101--proj--aaaa1111.md" dir))
+         (agent-pane-buffer-name "*agent-pane replay usage test*")
+         (chat-buf nil))
+    (unwind-protect
+        (progn
+          (agent-pane-test--write
+           f
+           (string-join
+            '("# agent-pane transcript"
+              ""
+              "- created: 2026-01-01 01:01:01"
+              "- project_root: /tmp/proj"
+              "- acp_session_id: sid-usage-123"
+              ""
+              "---"
+              ""
+              "## User — 2026-01-01 01:01:02"
+              ""
+              "hello"
+              ""
+              "## Agent — 2026-01-01 01:01:03"
+              ""
+              "world")
+            "\n"))
+          (let (opened)
+            (with-temp-buffer
+              (insert "** session\n")
+              (add-text-properties (point-min) (point-max)
+                                   (list 'agent-pane-session-file f
+                                         'agent-pane-project-root "/tmp/proj"))
+              (goto-char (point-min))
+              (cl-letf (((symbol-function 'pop-to-buffer)
+                         (lambda (buf &rest _args)
+                           (push buf opened)
+                           buf)))
+                (agent-pane-sessions-open-at-point)))
+            (setq chat-buf (car opened)))
+          (should (buffer-live-p chat-buf))
+          (with-current-buffer chat-buf
+            (let ((agent-pane-estimate-context-usage t))
+              (should-not (map-elt agent-pane--state :usage-metrics))
+              (let ((summary (agent-pane--ui-usage-summary)))
+                (should (stringp summary))
+                (should (string-match-p "ctx~=" summary))
+                (should (string-match-p "(~" summary))))))
+      (when (buffer-live-p chat-buf)
+        (kill-buffer chat-buf))
+      (ignore-errors (delete-directory dir t)))))
+
 (ert-deftest agent-pane-sessions-open-at-point-positions-new-chat-at-input ()
   (let* ((dir (make-temp-file "agent-pane-transcripts" t))
          (agent-pane-transcript-directory dir)

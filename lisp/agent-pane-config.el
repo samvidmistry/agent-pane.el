@@ -354,6 +354,10 @@ This makes progress visible even when the window is scrolled away from the
 footer."
   :type 'boolean
   :group 'agent-pane)
+(defcustom agent-pane-estimate-context-usage t
+  "When non-nil, estimate context usage locally when server usage is missing."
+  :type 'boolean
+  :group 'agent-pane)
 (defcustom agent-pane-save-transcripts 'interactive
   "Whether agent-pane should save chat transcripts to disk.
 When set to `interactive', transcripts are only saved when Emacs is

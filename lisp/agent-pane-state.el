@@ -76,6 +76,7 @@ MESSAGES is a list of message alists."
           (cons :available-model-ids nil)
           (cons :current-model-id nil)
           (cons :last-prompt-result nil)
+          (cons :usage-metrics nil)
           ;; Transcript.
           (cons :transcript-file nil)
           (cons :transcript-session-id-logged nil)
